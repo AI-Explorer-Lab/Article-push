@@ -45,6 +45,18 @@ OVERUSED_TEMPLATE_PATTERNS = [
     r"这条 AI 动态，真正值得看的是工程入口",
     r"真正考验的是落地边界",
     r"AI 进入真实研发流程的问题摆到了台前",
+    r"真正值得",
+    r"真正考验",
+    r"真正.*不是.*而是",
+    r"这条动态值得拆开看",
+    r"背后的技术信号",
+    r"不只要看功能",
+    r"不能只看功能",
+    r"这件事到底改变了什么",
+    r"先看它到底是什么",
+    r"这不是孤立更新",
+    r"最后落回一个简单问题",
+    r"放回日常工作里",
 ]
 
 
@@ -108,8 +120,8 @@ def verify_structure_by_type(text: str, article_type: str) -> tuple[list[str], l
         }
     elif article_type == "解读型":
         groups = {
-            "趋势问题": ["为什么", "趋势", "盯上", "值得单独看"],
-            "背后原因": ["背后", "原因", "因为", "本质"],
+            "信号边界": ["信号", "趋势", "边界", "观察"],
+            "机制解释": ["原因", "因为", "本质", "机制", "接入方式", "成本结构", "流程"],
             "技术含义": ["技术", "SDK", "API", "MCP", "harness", "上下文"],
             "影响判断": ["影响", "竞争", "开发者", "行业", "接下来"],
         }
@@ -147,21 +159,21 @@ def score_article(text: str, title: str, article_type: str | None) -> tuple[int,
     suggestions: list[str] = []
 
     first_sentence = re.split(r"[。！？\n]", intro.strip())[0]
-    if not has_any(intro, ["不是", "真正", "关键", "问题", "但", "反而", "值得"]):
+    if not has_any(intro, ["关键", "问题", "但", "反而", "边界", "流程", "成本", "接入"]):
         scores["hook"] -= 3
-        suggestions.append("开头缺少反差、问题或判断，建议前 200 字内制造继续读下去的钩子。")
+        suggestions.append("开头缺少具体问题或判断，建议前 200 字内交代对象、动作和矛盾。")
     if intro.startswith("今天") or intro.startswith("有一类"):
         scores["hook"] -= 3
         suggestions.append("开头略像流水账，可以直接从冲突或判断切入。")
-    if has_any(first_sentence, ["消息", "新闻", "项目"]) and not has_any(first_sentence, ["为什么", "不是", "真正", "问题"]):
+    if has_any(first_sentence, ["消息", "新闻", "项目"]) and not has_any(first_sentence, ["为什么", "问题", "边界", "成本", "流程"]):
         scores["hook"] -= 2
         suggestions.append("第一句话过于资讯化，建议用问题、矛盾或结论打开。")
-    if "？" not in intro and "！" not in intro and not has_any(intro[:120], ["不是", "但", "反而"]):
+    if "？" not in intro and "！" not in intro and not has_any(intro[:120], ["但", "反而", "边界", "流程"]):
         scores["hook"] -= 1
 
-    if not has_any(text, ["我觉得", "真正", "本质", "关键", "分水岭", "不是", "而是"]):
+    if not has_any(text, ["我觉得", "本质", "关键", "分水岭", "问题在于", "取决于", "边界", "成本"]):
         scores["point_of_view"] -= 4
-        suggestions.append("观点感偏弱，建议增加一句明确判断：这件事真正改变了什么。")
+        suggestions.append("观点感偏弱，建议增加一句明确判断：这件事改动了哪段流程或暴露了什么边界。")
     if len(re.findall(r"值得|重要|关键", text)) > 14:
         scores["point_of_view"] -= 2
         suggestions.append("高频判断词偏多，建议用更具体的场景替代抽象判断。")

@@ -7,6 +7,10 @@ AGENT.md -> reports/YYYY-MM-DD.json -> reports/YYYY-MM-DD.deepread.json
 It keeps hard-rule validation in the existing verify scripts. When a stage
 fails, it writes a proposed lesson log to errors/YYYY-MM-DD-log.md for human
 review; it never edits AGENT.md automatically.
+
+The run artifacts form an auditable episode package: source report, deepread
+selection, generated articles, short-term state, failure attribution, and
+verification output.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -41,10 +46,10 @@ STYLE_CONTRACTS = {
     "主线型": {
         "position": "围绕一条具体事件推进，先讲清楚原文发生了什么，再解释为什么重要。",
         "sections": [
-            "先把这件事说清楚",
-            "真正变化藏在流程里",
-            "它会影响谁的工作方式",
-            "还不能急着下结论",
+            "主体动作要先钉住",
+            "变化发生在执行链路",
+            "影响会落到具体角色",
+            "后续只看可验证进展",
         ],
         "must_answer": ["发生了什么", "谁做了什么", "为什么值得单独写", "后续应该看什么"],
         "tone": "事实密度优先，判断跟在事实后面，不写空泛趋势口号。",
@@ -52,10 +57,10 @@ STYLE_CONTRACTS = {
     "解读型": {
         "position": "围绕一个趋势或技术信号展开，原文事实是证据，文章重点是解释变化背后的原因。",
         "sections": [
-            "这不是孤立更新",
-            "背后的技术信号更值得看",
-            "开发者会先感到变化",
-            "判断它还要看落地成本",
+            "先限定这次信号的边界",
+            "技术变化落在接入方式",
+            "开发者会在流程里感到差异",
+            "判断成本比判断热度更重要",
         ],
         "must_answer": ["趋势是什么", "原文事实如何支撑趋势", "技术含义是什么", "对行业或开发者有什么影响"],
         "tone": "解释要克制，避免把单条新闻拔高成确定趋势。",
@@ -63,10 +68,10 @@ STYLE_CONTRACTS = {
     "工具型": {
         "position": "围绕工具、项目或产品展开，先说明它是什么，再说明适合谁、边界在哪里。",
         "sections": [
-            "先看它到底是什么",
-            "它适合解决哪类问题",
-            "包装之外要看任务生命周期",
-            "真正要验证的是边界",
+            "先确认它解决的问题",
+            "适用场景来自任务约束",
+            "工程价值取决于生命周期",
+            "边界要放到失败场景里看",
         ],
         "must_answer": ["它是什么", "适合谁", "技术看点是什么", "局限和验证点是什么"],
         "tone": "少写宣传词，多写使用场景、失败路径和工程约束。",
@@ -76,6 +81,8 @@ STYLE_CONTRACTS = {
 GENERIC_TITLES = {
     "这条 AI 动态，真正值得看的是工程入口",
     "这个项目，真正考验的是落地边界",
+    "这条动态值得拆开看",
+    "真正值得看的不是热闹",
 }
 
 
@@ -210,12 +217,12 @@ def article_title(item: dict, article_type: str) -> str:
     if article_type == "工具型" and "github.com/" in url:
         repo = url.rstrip("/").split("github.com/")[-1]
         name = repo.split("/")[-1] if "/" in repo else repo
-        return f"{name} 不只要看功能，还要看能不能进工作流"
+        return f"{name} 能不能进入工作流，要看状态和失败处理"
     compact = re.sub(r"GitHub 项目更新：", "", title)
     compact = compact.replace("！", "").replace("？", "")
     if article_type == "解读型":
-        return f"{compact[:22]}，背后的技术信号是什么"
-    return f"{compact[:24]}，这件事到底改变了什么"
+        return f"{compact[:22]}，关键在接入方式怎么变"
+    return f"{compact[:24]}，先看它改动了哪段流程"
 
 
 def extract_required_terms(text: str, url: str = "") -> list[str]:
@@ -301,9 +308,17 @@ def build_deepread(report_path: Path, deepread_path: Path, article_count: int) -
         "date": report["date"],
         "source_report": project_path(report_path),
         "generation_rule": (
-            "由 pipeline.py 从基础日报自动选择深挖条目。每条深挖新闻必须逐篇读取原文，"
-            "在原文事实基础上按文章类型改写；写完一篇即丢弃该篇上下文。"
+            "由 pipeline.py 从基础日报自动选择深挖条目。该文件属于当次 harness episode 的"
+            "上下文选择证据：每条深挖新闻必须逐篇读取原文，在原文事实基础上按文章类型改写；"
+            "写完一篇即丢弃该篇上下文。"
         ),
+        "harness_episode": {
+            "task_spec": "AGENT.md",
+            "context_selection": project_path(report_path),
+            "state_file": project_path(state_path(str(report["date"]))),
+            "verification": ["verify_deepread.py", "verify_article.py"],
+            "completion_rule": "来源真实、选择有据、文章独立、验证通过、失败可归因。",
+        },
         "selection_criteria": {
             "relevance": "优先选择相关度高、贴合 AI Agent、MCP、Coding Agent、Harness Engineering 的条目。",
             "writeability": "优先选择有明确问题、工具边界、工程启发或趋势判断的条目。",
@@ -345,13 +360,20 @@ def selection_reason(item: dict, article_type: str) -> str:
 def core_claim(item: dict, article_type: str) -> str:
     category = item.get("category", "AI")
     if article_type == "工具型":
-        return "Agent 工具真正的价值不只在能力展示，而在能否处理状态、权限、部署、失败和审查。"
+        return "Agent 工具的价值要落到状态、权限、部署、失败和审查这些生产问题上。"
     if article_type == "解读型":
         return "这类动态的重点不是单点功能，而是 AI 正在争夺进入真实系统的工程入口。"
-    return f"这次事件的重点不只是新闻本身，而是它暴露了 {category} 进入工程化阶段的新门槛。"
+    return f"这次事件暴露了 {category} 进入工程化阶段后必须处理的新门槛。"
 
 
-def generate_articles(deepread_path: Path, overwrite: bool) -> None:
+def generate_articles(
+    deepread_path: Path,
+    overwrite: bool,
+    use_llm_writer: bool = False,
+    llm_model: str | None = None,
+    llm_rewrite_attempts: int = 0,
+    llm_max_original_chars: int = 120000,
+) -> None:
     data = load_json(deepread_path)
     PAPER_DIR.mkdir(parents=True, exist_ok=True)
     STATES_DIR.mkdir(parents=True, exist_ok=True)
@@ -379,8 +401,24 @@ def generate_articles(deepread_path: Path, overwrite: bool) -> None:
             )
             continue
         output.parent.mkdir(parents=True, exist_ok=True)
-        text, rewrite_state = rewrite_one_article(item)
+        text, rewrite_state = rewrite_one_article(
+            item,
+            use_llm_writer=use_llm_writer,
+            llm_model=llm_model,
+            llm_max_original_chars=llm_max_original_chars,
+        )
         output.write_text(text, encoding="utf-8")
+        if use_llm_writer and llm_rewrite_attempts > 0:
+            text, rewrite_state = revise_article_with_llm_until_valid(
+                item=item,
+                output=output,
+                deepread_path=deepread_path,
+                current_text=text,
+                rewrite_state=rewrite_state,
+                llm_model=llm_model,
+                max_attempts=llm_rewrite_attempts,
+                llm_max_original_chars=llm_max_original_chars,
+            )
         print(f"Generated {project_path(output)}")
         article_states.append(
             {
@@ -397,7 +435,15 @@ def generate_articles(deepread_path: Path, overwrite: bool) -> None:
         {
             "date": data["date"],
             "source_deepread": project_path(deepread_path),
-            "state_policy": "短期状态只记录当天 pipeline 运行；跨天长期记忆只进入 AGENT.md。",
+            "harness_layers": {
+                "context": "deepread 只保存当前文章需要的选择理由、写作计划和关键对象。",
+                "tools": "抓取、生成和验证由固定脚本执行。",
+                "orchestration": "pipeline.py 串联日报、deepread、文章和验证阶段。",
+                "memory_state": "当天状态写入本文件；单篇上下文写完即丢弃。",
+                "evaluation_observation": "验证结果回写到对应文章状态。",
+                "constraints_recovery": "失败阶段写入 errors/，长期规则需人工确认。",
+            },
+            "state_policy": "短期状态只记录当天 pipeline episode；跨天长期记忆只进入 AGENT.md。",
             "articles": article_states,
         },
     )
@@ -510,6 +556,7 @@ def fetch_original_context(item: dict) -> dict:
             fetch_status = "fetched" if len(raw_text) >= 300 else "partial"
         except (HTTPError, URLError, TimeoutError, ValueError, OSError):
             raw_text = fallback
+            fetch_status = "failed"
     text = raw_text if raw_text else fallback
     terms = title_terms(title)
     sentences = split_sentences(text)
@@ -531,7 +578,7 @@ def fetch_original_context(item: dict) -> dict:
         facts.extend(
             [
                 f"{repo} 是一个近期更新的 GitHub 项目，标题和仓库描述把它放在 AI Coding 语境下讨论。",
-                "工具型项目不能只看能力展示，还要看它是否有明确的运行边界和失败处理方式。",
+                "工具型项目要检查运行边界、失败处理、权限控制和日志线索。",
                 "如果一个项目要进入团队工作流，部署、权限、日志和人工审查都需要提前设计。",
             ]
         )
@@ -540,6 +587,8 @@ def fetch_original_context(item: dict) -> dict:
         "subject": source_subject(item),
         "terms": terms,
         "facts": facts[:8],
+        "original_text": raw_text if fetch_status in {"fetched", "partial"} else "",
+        "original_char_count": chinese_char_count(raw_text),
     }
 
 
@@ -599,11 +648,150 @@ def fact_or_fallback(facts: list[str], index: int, fallback: str) -> str:
     return fallback
 
 
-def rewrite_one_article(item: dict) -> tuple[str, dict]:
+def require_llm_config(llm_model: str | None) -> tuple[str, str, str]:
+    api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    model = llm_model or os.environ.get("LLM_MODEL")
+    api_base = (os.environ.get("LLM_API_BASE") or "https://api.openai.com/v1").rstrip("/")
+    if not api_key:
+        raise RuntimeError("LLM writer needs LLM_API_KEY or OPENAI_API_KEY in the environment.")
+    if not model:
+        raise RuntimeError("LLM writer needs --llm-model or LLM_MODEL.")
+    return api_base, api_key, model
+
+
+def call_llm_chat(messages: list[dict], llm_model: str | None, temperature: float = 0.45) -> str:
+    api_base, api_key, model = require_llm_config(llm_model)
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    request = Request(
+        f"{api_base}/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=120) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"Unexpected LLM response shape: {data}") from exc
+    return normalize_llm_article(str(content))
+
+
+def normalize_llm_article(content: str) -> str:
+    content = content.strip()
+    fence_match = re.match(r"^```(?:markdown|md)?\s*(.*?)\s*```$", content, flags=re.S | re.I)
+    if fence_match:
+        content = fence_match.group(1).strip()
+    return content.rstrip() + "\n"
+
+
+def ensure_full_original_for_llm(context: dict, item: dict, max_chars: int) -> str:
+    original_text = str(context.get("original_text") or "")
+    status = context.get("status")
+    if status != "fetched" or chinese_char_count(original_text) < 300:
+        raise RuntimeError(
+            "LLM writer requires fetched full original text for each article; "
+            f"got status={status!r} for {item.get('title', '')!r}."
+        )
+    if len(original_text) > max_chars:
+        raise RuntimeError(
+            "Original text exceeds --llm-max-original-chars; refusing to excerpt automatically. "
+            f"chars={len(original_text)}, limit={max_chars}, title={item.get('title', '')!r}."
+        )
+    return original_text
+
+
+def build_llm_writer_prompt(item: dict, context: dict, original_text: str) -> list[dict]:
+    plan = item.get("article_plan") or {}
+    article_type = item.get("article_type", "")
+    contract = STYLE_CONTRACTS.get(article_type, {})
+    must_include = plan.get("must_include") or []
+    github_note = ""
+    if article_type == "工具型" and "github.com/" in str(item.get("url", "")).lower():
+        github_note = f"- 这是 GitHub/开源项目文章，标题后 8 行内必须保留项目链接：{item.get('url')}\n"
+    system = (
+        "你是严谨的技术公众号编辑。你只能基于用户提供的原文全文写作，"
+        "不得联网，不得添加原文没有的事实，不得把标题、关键词或摘要当作事实来源。"
+    )
+    user = f"""请基于下面的“原文全文”写一篇原创中文 Markdown 文章。
+
+硬性规则：
+- 只能使用原文全文中的事实；允许重组、解释、压缩和改写，但不允许新增事实。
+- 如果原文信息不足，必须降低判断强度，不要补细节。
+- 当前文章写完后，原文上下文会被丢弃；不要引用上一篇或其他文章的信息。
+- Markdown 必须以一个一级标题开头，且只能有一个一级标题。
+- 至少 3 个二级标题，二级标题必须写成具体判断。
+- 中文正文 1000-1800 字。
+- 不写“参考来源”“来源”“据某媒体报道”等归因区块。
+- 不写“真正值得看”“背后的技术信号”“这条动态值得拆开看”“不只要看功能”等模板腔。
+{github_note}
+文章类型：{article_type}
+类型写法：{contract.get("position", "")}
+必须回答：{"；".join(contract.get("must_answer", []))}
+标题建议：{plan.get("title", "")}
+核心判断：{plan.get("core_claim", "")}
+必须自然覆盖的关键对象：{"；".join(map(str, must_include))}
+
+原文标题：{item.get("title", "")}
+原文 URL：{item.get("url", "")}
+
+原文全文：
+{original_text}
+"""
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def rewrite_one_article_with_llm(
+    item: dict,
+    context: dict,
+    llm_model: str | None,
+    llm_max_original_chars: int,
+) -> tuple[str, dict]:
+    original_text = ensure_full_original_for_llm(context, item, llm_max_original_chars)
+    article = call_llm_chat(
+        build_llm_writer_prompt(item, context, original_text),
+        llm_model=llm_model,
+    )
+    rewrite_state = {
+        "writer": "llm",
+        "source_status": context.get("status"),
+        "fact_count": len(context.get("facts", [])),
+        "key_terms": context.get("terms", []),
+        "original_char_count": context.get("original_char_count", 0),
+        "context_discarded": True,
+        "llm_model": llm_model or os.environ.get("LLM_MODEL"),
+    }
+    return article, rewrite_state
+
+
+def rewrite_one_article(
+    item: dict,
+    use_llm_writer: bool = False,
+    llm_model: str | None = None,
+    llm_max_original_chars: int = 120000,
+) -> tuple[str, dict]:
     article_type = item["article_type"]
     contract = STYLE_CONTRACTS[article_type]
     plan = item["article_plan"]
     context = fetch_original_context(item)
+    if use_llm_writer:
+        article, rewrite_state = rewrite_one_article_with_llm(
+            item=item,
+            context=context,
+            llm_model=llm_model,
+            llm_max_original_chars=llm_max_original_chars,
+        )
+        context.pop("original_text", None)
+        del context
+        return article, rewrite_state
+
     facts = context["facts"]
     title = str(plan["title"])
     subject = context["subject"]
@@ -643,19 +831,127 @@ def rewrite_one_article(item: dict) -> tuple[str, dict]:
         article = wrap_long_paragraphs(
             article.rstrip()
             + "\n\n"
-            + f"最后还要补上一点：围绕「{subject}」写作时，真正的质量不来自固定句式，而来自事实、判断和边界的配合。事实让文章不虚，判断让文章有方向，边界让文章不过度拔高。"
-            + "如果原文能提供足够细节，文章就应该多还原动作和流程；如果原文细节有限，文章就要更清楚地标出观察口径，而不是用确定语气替读者下结论。"
-            + "这也是当天短期状态值得记录的原因：它能提醒我们某篇文章是原文事实充足，还是靠摘要和标题完成了改写。两种情况都可以发布，但编辑判断应该不同。"
+            + f"补充一层编辑判断：围绕「{subject}」写作时，质量来自事实、判断和边界的配合。事实负责把对象说准，判断负责指出变化方向，边界负责避免把单条材料拔高成结论。"
+            + "如果原文能提供足够细节，文章就多还原动作和流程；如果原文细节有限，文章就明确观察口径，用谨慎语气处理不确定部分。"
+            + "当天短期状态也因此有必要保留：它能标出某篇文章是原文事实充足，还是主要依赖摘要和标题完成改写。两种情况都可以进入编辑流程，但发布判断应该不同。"
             + "\n"
         )
     rewrite_state = {
+        "writer": "rule_based",
         "source_status": context.get("status"),
         "fact_count": len(facts),
         "key_terms": context.get("terms", []),
+        "original_char_count": context.get("original_char_count", 0),
         "context_discarded": True,
     }
+    context.pop("original_text", None)
     del context
     return article, rewrite_state
+
+
+def verify_article_json(output: Path, deepread_path: Path) -> dict:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "verify_article.py",
+            project_path(output),
+            "--deepread",
+            project_path(deepread_path),
+            "--json",
+        ],
+        cwd=ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+    )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Could not parse verify_article.py JSON output: {completed.stdout}") from exc
+    if not payload:
+        raise RuntimeError("verify_article.py returned an empty result list.")
+    return payload[0]
+
+
+def build_llm_revision_prompt(
+    item: dict,
+    context: dict,
+    original_text: str,
+    current_text: str,
+    verification: dict,
+) -> list[dict]:
+    system = (
+        "你是严谨的技术公众号编辑。你正在修订一篇未通过校验的文章。"
+        "只能基于原文全文和当前文章修订，不得新增原文没有的事实。"
+    )
+    errors = "\n".join(f"- {msg}" for msg in verification.get("errors", [])) or "- 无"
+    warnings = "\n".join(f"- {msg}" for msg in verification.get("warnings", [])) or "- 无"
+    suggestions = "\n".join(f"- {msg}" for msg in verification.get("rewrite_suggestions", [])) or "- 无"
+    user = f"""请修订下面的 Markdown 文章，让它通过校验。
+
+硬性规则：
+- 只能基于原文全文修订，不允许新增事实。
+- 保留一个一级标题，至少 3 个二级标题。
+- 不写“真正值得看”“背后的技术信号”“这条动态值得拆开看”“不只要看功能”等模板腔。
+- 直接输出完整 Markdown，不要解释。
+
+文章类型：{item.get("article_type", "")}
+原文标题：{item.get("title", "")}
+原文 URL：{item.get("url", "")}
+
+校验错误：
+{errors}
+
+校验警告：
+{warnings}
+
+重写建议：
+{suggestions}
+
+当前文章：
+{current_text}
+
+原文全文：
+{original_text}
+"""
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def revise_article_with_llm_until_valid(
+    item: dict,
+    output: Path,
+    deepread_path: Path,
+    current_text: str,
+    rewrite_state: dict,
+    llm_model: str | None,
+    max_attempts: int,
+    llm_max_original_chars: int,
+) -> tuple[str, dict]:
+    attempts = 0
+    for attempts in range(1, max_attempts + 1):
+        verification = verify_article_json(output, deepread_path)
+        if verification.get("passed"):
+            rewrite_state["llm_revision_attempts"] = attempts - 1
+            return current_text, rewrite_state
+
+        context = fetch_original_context(item)
+        original_text = ensure_full_original_for_llm(context, item, llm_max_original_chars)
+        revised = call_llm_chat(
+            build_llm_revision_prompt(item, context, original_text, current_text, verification),
+            llm_model=llm_model,
+            temperature=0.35,
+        )
+        output.write_text(revised, encoding="utf-8")
+        current_text = revised
+        rewrite_state["original_char_count"] = context.get("original_char_count", 0)
+        context.pop("original_text", None)
+        del context
+
+    final_verification = verify_article_json(output, deepread_path)
+    rewrite_state["llm_revision_attempts"] = attempts
+    rewrite_state["llm_revision_passed"] = bool(final_verification.get("passed"))
+    return current_text, rewrite_state
 
 
 def expand_if_short(article: str, article_type: str, subject: str) -> str:
@@ -663,19 +959,19 @@ def expand_if_short(article: str, article_type: str, subject: str) -> str:
         return article
     if article_type == "工具型":
         addition = f"""
-再把「{subject}」放到团队环境里看，判断标准会更清楚。真正要上线的工具，不能只在作者机器上跑通一次，还要能解释依赖什么环境、访问哪些资源、失败时留下什么线索。
+把「{subject}」放到团队环境里看，判断标准会更清楚。一个要上线的工具，不能只在作者机器上跑通一次，还要能解释依赖什么环境、访问哪些资源、失败时留下什么线索。
 
-这也是我更看重边界而不是包装的原因。Agent 工具一旦进入代码仓库、云资源或企业系统，权限、日志、回滚和审查都会变成硬问题。它是什么、适合谁、技术看点和局限，最后都要落到这些问题上。
+Agent 工具一旦进入代码仓库、云资源或企业系统，权限、日志、回滚和审查都会变成硬问题。它是什么、适合谁、技术看点和局限，最后都要落到这些问题上。
 
 换句话说，工具型文章的风格控制不靠固定模板，而靠问题清单：能不能运行，能不能接管，能不能审查，能不能在失败后继续。这些问题比一句漂亮介绍更接近真实使用。
 
-如果后续继续观察这个项目，我会优先看三个变化：文档是否补齐真实任务示例，权限和状态是否能被清楚配置，失败日志是否能帮助下一次执行。只有这些细节变扎实，工具才不只是一个仓库链接。
+如果后续继续观察这个项目，可以优先看三个变化：文档是否补齐真实任务示例，权限和状态是否能被清楚配置，失败日志是否能帮助下一次执行。只有这些细节变扎实，工具才有机会从候选仓库进入团队流程。
 
 对读者来说，最实用的读法也很简单：先不要问它是不是很酷，而要问它能不能放进自己的工作流。如果答案还不清楚，就把它当成候选工具继续观察，而不是马上当成生产方案。
 """
     elif article_type == "解读型":
         addition = f"""
-放到「{subject}」这个具体对象上，解读还需要多一层克制。它可以说明一个方向正在变热，但不能自动证明所有团队都会马上采用。真正的分水岭，是开发者是否愿意把它接进已有流程。
+放到「{subject}」这个具体对象上，解读还需要多一层克制。它可以说明一个方向正在变热，但不能自动证明所有团队都会马上采用。分水岭在于开发者是否愿意把它接进已有流程。
 
 所以后续应该看两个指标。第一，它有没有降低真实任务的接入成本；第二，它有没有让结果更容易检查和复盘。只有这两点成立，技术信号才会从一次热闹更新变成可持续的工作方式。
 
@@ -685,13 +981,13 @@ def expand_if_short(article: str, article_type: str, subject: str) -> str:
 """
     else:
         addition = f"""
-把「{subject}」放回日常工作里，这次事件的意义会更具体。它不是单纯告诉我们 AI 又能完成一个结果，而是在提醒团队重新划分任务：哪些步骤可以交给系统推进，哪些判断必须由人负责。
+把「{subject}」放到具体团队流程里看，这次事件的意义会更清楚。它不是单纯告诉我们 AI 又能完成一个结果，而是在提醒团队重新划分任务：哪些步骤可以交给系统推进，哪些判断必须由人负责。
 
 接下来应该看的不是一句口号，而是这套做法能不能反复运行。能反复运行，才说明它进入了工作流；只能偶尔惊艳一次，就仍然停留在案例层面。
 
-这也是主线型文章需要保持的风格：先让读者知道事实，再给判断；先还原动作，再谈影响。这样文章才像基于原文的改写，而不是换一个标题重新发挥。
+主线型文章需要保持这个顺序：先让读者知道事实，再给判断；先还原动作，再谈影响。这样文章才像基于原文的改写，而不是换一个标题重新发挥。
 
-所以这篇文章最后落回一个简单问题：这次事件留下的是一次讨论热度，还是一种可以被更多人复用的方法。如果是后者，后续一定会出现更清楚的流程、边界和验证方式。
+所以这篇文章的收束点是可复用性：这次事件留下的是一次讨论热度，还是一种可以被更多人复用的方法。如果是后者，后续一定会出现更清楚的流程、边界和验证方式。
 """
     return article.rstrip() + "\n" + addition
 
@@ -722,21 +1018,21 @@ def wrap_long_paragraphs(article: str) -> str:
 
 
 def build_intro(article_type: str, subject: str, claim: str, facts: list[str]) -> str:
-    first_fact = fact_or_fallback(facts, 0, f"原文围绕「{subject}」展开，重点不是一句标题能概括的热闹。")
+    first_fact = fact_or_fallback(facts, 0, f"原文围绕「{subject}」给出了一个具体对象和动作。")
     if article_type == "工具型":
         return (
-            f"为什么工具型项目不能只看功能？因为介绍页里的大词很容易遮住真正的工程问题。围绕「{subject}」，更应该先问它到底解决什么问题，"
-            f"又把哪些工程边界暴露了出来。{first_fact} 这篇文章会在原文事实基础上，把它放回真实使用场景里看："
-            "它能否安装、能否接进任务、能否留下状态，远比一句能力描述更重要。"
+            f"工具型项目先看定位，再看接入成本。围绕「{subject}」，需要问清楚它解决什么任务，"
+            f"又把哪些工程边界暴露出来。{first_fact} 这篇文章会把它放回真实使用场景里看："
+            "它能否安装、能否接进任务、能否留下状态，比一句能力描述更有信息量。"
         )
     if article_type == "解读型":
         return (
-            f"这条动态值得拆开看，不是因为它一定代表终局，而是因为它提供了一个观察技术变化的入口。"
-            f"{first_fact} 我的判断是：{claim} 但这个判断必须从原文里的具体事实长出来，不能只靠概念拔高。"
-            "换句话说，先看事实怎么发生，再看它可能改写哪一段开发者流程。"
+            f"这条动态可以作为一个技术信号来读，但边界要先说清楚。{first_fact} "
+            f"我的判断是：{claim} 这个判断需要回到原文里的具体事实，不能只靠概念拔高。"
+            "先看事实怎么发生，再看它可能改写哪一段开发者流程。"
         )
     return (
-        f"这次事件不能只按普通资讯读。{first_fact} 真正值得追问的是：它具体改变了哪段流程，"
+        f"这次事件先按事实读，再按流程读。{first_fact} 需要追问的是：它具体改变了哪段流程，"
         f"哪些环节仍然需要人来判断，以及它为什么会被放到今天的 AI Agent 语境里讨论。"
         "如果这几个问题讲不清楚，文章就只是在复述标题。"
     )
@@ -747,7 +1043,7 @@ def build_first_section(article_type: str, facts: list[str], claim: str) -> str:
     second = fact_or_fallback(facts, 1, "这类信息需要先还原动作、对象和结果，再谈影响。")
     if article_type == "工具型":
         return (
-            f"它是什么，可以先从原文给出的对象说起。{first} {second} 所以它不应该被简单理解成又一个“Agent 项目”，"
+            f"先从原文给出的对象说起。{first} {second} 所以它不应该被简单理解成又一个“Agent 项目”，"
             "而要看它有没有把任务、工具、状态和使用者放进同一个可运行的流程里。适合谁，也要从这里判断："
             "如果团队只是想做一次演示，包装就够了；如果要让 AI 反复参与真实任务，就必须关心安装、配置、权限和失败恢复。"
         )
@@ -758,7 +1054,7 @@ def build_first_section(article_type: str, facts: list[str], claim: str) -> str:
             "任务分工或者成本结构。"
         )
     return (
-        f"先看事实层。{first} {second} 如果只把它当成一条热闹新闻，就会漏掉更关键的问题："
+        f"先看事实层。{first} {second} 如果只把它当成一条热闹新闻，就会漏掉流程问题："
         "这次事件到底是一次展示，还是已经开始改变某个真实工作流。为什么重要，也要从这里回答："
         "只有当流程被拆开、责任被重新分配，AI 的能力才不只是一次结果展示。"
     )
@@ -776,7 +1072,7 @@ def build_second_section(article_type: str, facts: list[str]) -> str:
         )
     if article_type == "解读型":
         return (
-            f"{third} {fourth} 趋势判断不能脱离这些细节。真正有价值的解读，是说明为什么这些小变化会改变入口、"
+            f"{third} {fourth} 趋势判断不能脱离这些细节。有效的解读，是说明为什么这些小变化会改变入口、"
             "成本、开发者习惯或组织流程。比如开发者过去只需要关心一次调用，现在可能要关心上下文怎么传递、"
             "工具怎么接入、失败怎么复盘，以及哪些步骤需要人类确认。"
         )
@@ -788,7 +1084,7 @@ def build_second_section(article_type: str, facts: list[str]) -> str:
 
 
 def build_third_section(article_type: str, facts: list[str]) -> str:
-    fifth = fact_or_fallback(facts, 4, "从使用者视角看，真正影响工作的是能不能把结果接进下一步。")
+    fifth = fact_or_fallback(facts, 4, "从使用者视角看，影响工作的是能不能把结果接进下一步。")
     sixth = fact_or_fallback(facts, 5, "如果缺少验证和复盘，再漂亮的结果也很难变成稳定流程。")
     if article_type == "工具型":
         return (
@@ -815,7 +1111,7 @@ def build_final_section(article_type: str, facts: list[str], contract: dict) -> 
     if article_type == "工具型":
         return (
             f"{seventh} {eighth} 所以最后的判断要克制：少看它说自己能做什么，多看它在失败、权限、部署、"
-            f"成本和人工审查面前怎么表现。{contract['tone']} 需要验证的不是一句介绍，而是它能不能承受重复任务、"
+            f"成本和人工审查面前怎么表现。{contract['tone']} 需要验证的不是一句介绍，而是它能否承受重复任务、"
             "异常输入和多人协作。"
         )
     if article_type == "解读型":
@@ -859,6 +1155,7 @@ def write_error_log(day: str, results: list[StageResult]) -> Path:
         "",
         f"- 记录时间：{datetime.now().isoformat(timespec='seconds')}",
         "- 状态：需要人工确认后再写入 AGENT.md",
+        "- 用途：作为当次 harness episode 的失败归因材料，不自动改写长期规则",
         "",
         "## 失败阶段",
         "",
@@ -903,6 +1200,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-fetch", action="store_true", help="Use existing report JSON instead of running agent.py.")
     parser.add_argument("--refresh-deepread", action="store_true", help="Regenerate reports/YYYY-MM-DD.deepread.json.")
     parser.add_argument("--overwrite-articles", action="store_true", help="Regenerate Markdown articles even if they exist.")
+    parser.add_argument("--use-llm-writer", action="store_true", help="Use an LLM to rewrite each article from the full original text.")
+    parser.add_argument("--llm-model", default=None, help="LLM model name. Defaults to LLM_MODEL.")
+    parser.add_argument("--llm-rewrite-attempts", type=int, default=1, help="LLM revision attempts after verify_article.py fails.")
+    parser.add_argument(
+        "--llm-max-original-chars",
+        type=int,
+        default=120000,
+        help="Fail instead of excerpting when original text exceeds this character limit.",
+    )
     return parser.parse_args()
 
 
@@ -954,7 +1260,28 @@ def main() -> None:
     else:
         print(f"Keep existing {project_path(deepread_path)}")
 
-    generate_articles(deepread_path, overwrite=args.overwrite_articles)
+    try:
+        generate_articles(
+            deepread_path,
+            overwrite=args.overwrite_articles,
+            use_llm_writer=args.use_llm_writer,
+            llm_model=args.llm_model,
+            llm_rewrite_attempts=args.llm_rewrite_attempts,
+            llm_max_original_chars=args.llm_max_original_chars,
+        )
+    except Exception as exc:
+        results.append(
+            StageResult(
+                name="generate articles",
+                command=[sys.executable, "pipeline.py", "--date", args.date],
+                returncode=1,
+                stdout="",
+                stderr=f"{exc}\n\n{traceback.format_exc()}",
+            )
+        )
+        print_stage(results[-1])
+        write_error_log(args.date, results)
+        raise SystemExit(1)
 
     results.append(run_stage("verify deepread", [sys.executable, "verify_deepread.py", project_path(deepread_path)]))
     if not results[-1].ok:

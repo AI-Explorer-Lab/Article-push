@@ -2,8 +2,7 @@
 
 Pipeline:
 1. Fetch lead articles from the user's requested sources:
-   - Challenge Hub, QbitAI, AI学习的老章 through Sogou WeChat search.
-   - QbitAI through its public WordPress JSON mirror.
+   - Challenge Hub, 量子位, AI学习的老章 through Sogou WeChat search.
    - OpenAI, Anthropic, Google DeepMind, Jiqizhixin, GitHub through public pages/APIs.
 2. Fetch article pages again as second-stage evidence when possible.
 3. Rank, classify, summarize, and write reports/YYYY-MM-DD.json for verify.py.
@@ -81,7 +80,7 @@ FOCUS_TOPICS = {
 
 LEAD_SOURCES = [
     "Challenge Hub（微信公众号，经搜狗微信搜索）",
-    "量子位（微信公众号 / QbitAI 网页镜像）",
+    "量子位（微信公众号，经搜狗微信搜索）",
     "AI学习的老章（微信公众号，经搜狗微信搜索）",
     "机器之心",
     "OpenAI Blog",
@@ -181,45 +180,6 @@ def within_days(value: str, days: int) -> bool:
     except ValueError:
         return True
     return item_date >= date.today() - timedelta(days=days)
-
-
-def fetch_qbitai(days: int, logs: list[FetchLog]) -> list[Candidate]:
-    url = f"https://www.qbitai.com/wp-json/wp/v2/posts?per_page=30&orderby=date&order=desc"
-    try:
-        payload = json.loads(fetch_text(url))
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-        logs.append(FetchLog("QbitAI WordPress", url, False, str(exc)))
-        return []
-
-    logs.append(FetchLog("QbitAI WordPress", url, True, f"{len(payload)} posts"))
-    items: list[Candidate] = []
-    for post in payload:
-        published = parse_date(post.get("date", ""))
-        if not within_days(published, days):
-            continue
-        title = strip_tags(post.get("title", {}).get("rendered", ""))
-        excerpt = strip_tags(post.get("excerpt", {}).get("rendered", ""))
-        content = strip_tags(post.get("content", {}).get("rendered", ""))[:3000]
-        link = post.get("link", "")
-        items.append(
-            Candidate(
-                title=title,
-                source="量子位 / QbitAI",
-                url=link,
-                published_at=published,
-                snippet=excerpt,
-                body=content,
-                evidence=[
-                    {
-                        "kind": "wechat_mirror",
-                        "source": "量子位 / QbitAI",
-                        "url": link,
-                        "note": "QbitAI WordPress JSON 返回的公众号/媒体网页镜像。",
-                    }
-                ],
-            )
-        )
-    return items
 
 
 def fetch_sogou_wechat(account: str, query_terms: str, logs: list[FetchLog]) -> list[Candidate]:
@@ -417,7 +377,7 @@ def classify(candidate: Candidate) -> tuple[str, int]:
         scores[category] = sum(text.count(keyword.lower()) for keyword in keywords)
 
     best_category, best_score = max(scores.items(), key=lambda item: item[1])
-    source_bonus = 1 if any(name in candidate.source.lower() for name in ["qbitai", "量子位", "github", "challenge hub"]) else 0
+    source_bonus = 1 if any(name in candidate.source.lower() for name in ["量子位", "github", "challenge hub"]) else 0
     relevance = min(5, max(1, best_score + source_bonus))
     return best_category, relevance
 
@@ -462,7 +422,6 @@ def to_report_item(candidate: Candidate) -> dict | None:
 
 def collect_candidates(days: int, logs: list[FetchLog]) -> list[Candidate]:
     candidates: list[Candidate] = []
-    candidates.extend(fetch_qbitai(days, logs))
     candidates.extend(fetch_sogou_wechat("Challenge Hub", "AI Agent MCP 2026", logs))
     candidates.extend(fetch_sogou_wechat("量子位", "AI Agent MCP 2026", logs))
     candidates.extend(fetch_sogou_wechat("AI学习的老章", "AI Agent MCP 2026", logs))
@@ -513,8 +472,8 @@ def collect_candidates(days: int, logs: list[FetchLog]) -> list[Candidate]:
 def source_bucket(source: str) -> str:
     if "Challenge Hub" in source:
         return "Challenge Hub"
-    if "量子位" in source or "QbitAI" in source:
-        return "QbitAI"
+    if "量子位" in source:
+        return "量子位公众号"
     if "GitHub" in source:
         return "GitHub"
     if "Anthropic" in source:
@@ -590,7 +549,7 @@ def build_report(report_date: str | None, days: int, limit: int) -> dict:
         "date": report_date or date.today().isoformat(),
         "topic_focus": "AI Agent、MCP、Context Engineering 与 AI Coding",
         "lead_sources": LEAD_SOURCES,
-        "method": "真实抓取公众号搜索/媒体镜像/官方博客/GitHub API，随后二次抓取候选链接正文并按关键词分类、去重、摘要。",
+        "method": "真实抓取公众号搜索、官方博客、行业媒体首页和 GitHub API；量子位只使用搜狗微信公众号线索，不使用 QbitAI 网页或 WordPress 镜像。随后二次抓取可访问候选链接正文并按关键词分类、去重、摘要。",
         "run_meta": {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "lookback_days": days,
