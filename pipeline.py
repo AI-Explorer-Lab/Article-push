@@ -35,6 +35,15 @@ def configure_console() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+def load_agent_rules() -> str:
+    if not AGENT_RULES.exists():
+        raise SystemExit("AGENT.md not found; pipeline needs the project rule contract.")
+    rules = AGENT_RULES.read_text(encoding="utf-8")
+    if not rules.strip():
+        raise SystemExit("AGENT.md is empty; pipeline needs a non-empty rule contract.")
+    return rules
+
+
 @dataclass
 class StageResult:
     name: str
@@ -138,10 +147,11 @@ def build_deepread(report_path: Path, deepread_path: Path, article_count: int) -
         reverse=True,
     )[:article_count]
     selected = []
+    used_outputs: set[str] = set()
     for item in items:
         article_type = infer_article_type(item)
         title = article_title(item, article_type)
-        output_file = f"daily_paper/{report['date']}-{slugify(title)}.md"
+        output_file = unique_output_file(report["date"], title, item, used_outputs)
         selected.append(
             {
                 "title": item.get("title", ""),
@@ -177,6 +187,23 @@ def build_deepread(report_path: Path, deepread_path: Path, article_count: int) -
     print(f"Generated {project_path(deepread_path)} with {len(selected)} selected items")
 
 
+def unique_output_file(day: str, title: str, item: dict, used_outputs: set[str]) -> str:
+    base = slugify(title)
+    output = f"daily_paper/{day}-{base}.md"
+    if output not in used_outputs:
+        used_outputs.add(output)
+        return output
+
+    hint = slugify(source_subject(item), max_len=18)
+    output = f"daily_paper/{day}-{base}-{hint}.md"
+    counter = 2
+    while output in used_outputs:
+        output = f"daily_paper/{day}-{base}-{hint}-{counter}.md"
+        counter += 1
+    used_outputs.add(output)
+    return output
+
+
 def selection_reason(item: dict, article_type: str) -> str:
     category = item.get("category", "AI")
     if article_type == "工具型":
@@ -207,6 +234,31 @@ def generate_articles(deepread_path: Path, overwrite: bool) -> None:
         text = render_article(item)
         output.write_text(text, encoding="utf-8")
         print(f"Generated {project_path(output)}")
+
+
+def verify_selected_articles(deepread_path: Path) -> list[StageResult]:
+    data = load_json(deepread_path)
+    results: list[StageResult] = []
+    seen: set[str] = set()
+    for item in data.get("selected_items", []):
+        output_file = item.get("output_file")
+        if not output_file or output_file in seen:
+            continue
+        seen.add(output_file)
+        results.append(
+            run_stage(
+                f"verify article {Path(output_file).name}",
+                [
+                    sys.executable,
+                    "verify_article.py",
+                    output_file,
+                    "--deepread",
+                    project_path(deepread_path),
+                    "--verbose",
+                ],
+            )
+        )
+    return results
 
 
 def render_article(item: dict) -> str:
@@ -250,11 +302,19 @@ def render_main_article(item: dict) -> str:
 
 举个例子，如果 AI 帮团队完成一次调研，真正有价值的不是它写了几段摘要，而是它能否说明信息来自哪里、哪些结论只是推断、哪些地方需要补证据、哪些任务已经完成。没有这些结构，结果再顺滑也很难进入严肃流程。
 
-## 接下来应该看系统能力
+## 系统能力决定后半程
 
-接下来值得看的，不只是同类新闻还会不会出现，而是这些能力会不会被放进更稳定的 harness 里。也就是有没有明确输入、明确输出、明确验证、明确失败处理，以及能不能把经验沉淀为下一轮规则。
+接下来值得看的，不只是同类新闻还会不会出现，而是这些能力会不会被放进更稳定的 harness 里。也就是有没有明确输入、明确输出、明确验证、明确失败处理，以及能不能把经验沉淀为下一轮规则。没有这套外壳，能力只能停留在一次性惊艳；有了这套外壳，能力才可能被团队反复使用。
 
 所以这条新闻的长期价值，不在于制造一次惊讶，而在于提醒我们：AI 的下一步不是单纯更会生成，而是更会被约束地执行。真正成熟的系统，应该既能把事情往前推，也能让人知道它为什么这样推、推到哪里、哪些地方还不能放心。
+
+对开发者来说，这也意味着评估 AI 进展时要换一个问题。不要只问“它能不能完成”，还要问“它能不能解释完成路径，能不能接受测试，能不能在失败后继续，能不能把规则留给下一次”。这些问题听起来没有模型分数刺激，却更接近真实生产环境。
+
+如果把这件事放回日常工作，它其实是在提醒团队重新设计协作方式。AI 不应该只出现在最后的写作或代码生成环节，而应该进入需求澄清、资料收集、方案比较、结果验证和复盘沉淀。每一层都留下检查点，人才敢把更多任务交给系统。
+
+换句话说，真正的进步不是少写几行提示词，而是让任务从开始到结束都有可检查的轨迹。
+
+这条轨迹越清楚，团队越容易把惊喜变成稳定生产力，也越容易复用。
 """
 
 
@@ -272,17 +332,21 @@ def render_analysis_article(item: dict) -> str:
 
 这不是一个纯市场问题，而是技术问题。模型要进入业务系统，必须理解上下文，调用工具，处理失败，并且让开发者知道每一步发生了什么。如果入口层做得粗糙，再强的模型也可能停留在 demo。
 
-## 背后原因是工作流变长了
+## 任务链路变长，入口才会变重
 
 背后原因并不复杂：AI 任务正在变长。过去一次调用就能完成的场景，现在会变成多步执行、多人确认、多个系统协作。只靠聊天窗口承载这些流程，很快就会遇到状态丢失、权限不清、测试缺位和成本不可控的问题。
 
 比如一个团队想把 AI 接入客服、研发或数据分析流程，开发者不会只问模型聪不聪明。他们会问：有没有稳定 SDK？错误怎么处理？日志能不能追踪？上下文如何隔离？权限能不能收紧？这些才是生产环境里的真实门槛。
 
-## 技术含义是上下文要被工程化
+一旦任务链路变长，入口就不再只是调用方式，而会变成控制面。它决定模型看见什么、能做什么、怎么回滚、谁来批准。很多 AI 产品最后拼的不是一次生成质量，而是谁能把这些细节变成默认能力。
+
+## 上下文正在变成工程对象
 
 技术上，这意味着 Context Engineering 和 Harness Engineering 会变得更重要。上下文不再只是提示词长度，而是任务状态、工具返回、权限范围、用户意图和历史决策的组合。harness 也不只是测试脚本，而是把输入、执行、评测和反馈串起来的外壳。
 
 这会影响开发者的架构选择。API 和 SDK 要提供清晰边界，MCP 这类连接协议要解决工具接入问题，评测要覆盖真实任务而不是只看单轮回答。真正的难点，是把这些部件放到一个能长期运行的系统里。
+
+如果上下文没有被工程化，系统就会依赖临时提示词和人工记忆；如果上下文被结构化，Agent 才能知道当前目标、历史决策、可用工具和禁止动作。这个差别会直接影响稳定性，也会影响团队是否敢把流程交给 AI。
 
 ## 影响会落到开发者习惯上
 
@@ -291,6 +355,12 @@ def render_analysis_article(item: dict) -> str:
 接下来应该看两件事。第一，这类入口能不能让开发者少写胶水代码。第二，它能不能在失败时给出足够清楚的证据链。因为真正的生产系统不怕出错，怕的是出错后没人知道错在哪里。
 
 所以，这条动态的本质不是热闹，而是 AI 工程化继续往前走了一步。模型公司争夺的也不只是注意力，而是进入真实系统的默认路径。
+
+更长远地看，开发者入口会变成新的护城河。谁能让接入、调试、监控和治理更自然，谁就更容易进入真实业务。模型本身仍然重要，但模型之外的工程层，正在决定这些能力能不能真正落地。
+
+这也是今天很多 AI 动态容易被误读的地方。表面看是一个新能力，深一层看是一次工程位置的移动：模型不再只在应用边缘回答问题，而是沿着 SDK、API、工具协议和运行环境进入系统内部。进入得越深，约束就越重要。
+
+所以判断这类动态，不能只看发布时的亮点，还要看它能不能降低下一次接入、排错和复盘的成本。
 """
 
 
@@ -309,17 +379,21 @@ def render_tool_article(item: dict) -> str:
 
 这件事的定位很重要。普通聊天产品以对话为中心，用户问一句，模型答一句。Agent 工具则以任务为中心：目标是什么，步骤怎么拆，工具怎么调，状态怎么保存，什么时候需要人类确认。
 
-## 适合谁看，要看任务是不是会变长
+## 长任务才会暴露真正门槛
 
 适合谁？如果你在做个人助手、研发自动化、企业内部 Agent 平台，或者任何需要 AI 持续推进任务的产品，这类项目值得关注。因为任务一旦变长，单轮对话就不够了。
 
 举个例子，让 AI 解释一段代码很简单；让 AI 在仓库里修问题、跑测试、记录变更、等待审查、根据失败日志继续修改，就完全是另一类系统。这里的关键不只是模型，而是工作流、权限、CI、日志和上下文。
 
-## 技术看点在边界，而不是包装
+更具体一点，长任务会逼出很多隐藏问题：任务状态是否能恢复，工具调用是否有范围，用户是否能中途接管，失败日志是否能被下一轮使用。这些都不是聊天能力能自然解决的，需要项目在设计上提前留下位置。
+
+## 边界设计比包装更重要
 
 技术看点可以放在几个关键词上：Agent、工具、上下文、工作流、权限、部署、测试和审查。{claim} 如果这些边界不清楚，Agent 越主动，系统风险越高。
 
 我最关注的是它能不能把执行过程变成可追踪对象。比如每一步用了什么输入，调用了什么工具，产生了什么输出，哪些地方失败，哪些地方需要人工批准。没有这些记录，所谓自动化很容易变成不可复盘的黑箱。
+
+边界不是为了限制能力，而是为了让能力可以被信任。一个 Agent 如果只能在理想输入下运行，那更像演示；如果它能在权限受限、工具失败、上下文不完整的情况下仍然给出可解释状态，它才开始接近工程工具。
 
 ## 真正要验证的是稳定性
 
@@ -327,11 +401,15 @@ def render_tool_article(item: dict) -> str:
 
 所以不要只看项目介绍里的大词。真正决定它价值的，是它能不能承受重复任务、异常输入、工具失败和人工审查。Agent 工具如果没有这些约束，很容易只适合演示；有了这些约束，才可能成为团队愿意长期使用的基础设施。
 
-## 接下来值得看工程闭环
+## 工程闭环决定能不能长期使用
 
 接下来值得看的是，它会不会形成完整 harness：明确输入，明确执行步骤，明确验证规则，明确错误日志，再把踩过的坑沉淀成下一轮规则。只有这样，Agent 才不是一次性脚本，而是可以持续改进的系统。
 
 这也是工具型项目最容易被低估的地方。真正有价值的不是界面多漂亮，而是能不能让人放心把任务交出去，并且在结果不对时知道应该从哪里查起。
+
+所以评估这类项目时，不妨少看宣传词，多看失败路径。它如何处理异常？如何记录决策？如何让人类确认高风险动作？如何把一次失败变成下一次规则？这些问题的答案，才决定它能不能从有趣项目变成可依赖工具。
+
+如果这个方向继续往前走，工具项目之间的差异也会越来越清楚。浅层工具比的是调用方便，深层工具比的是能否把任务生命周期管住：开始、执行、暂停、审查、失败、恢复、归档。能管住生命周期，Agent 才能从助手变成系统组件。
 """
 
 
@@ -344,6 +422,8 @@ def proposed_lessons(results: list[StageResult]) -> list[str]:
         lessons.append("写入 Markdown 时必须使用无 BOM UTF-8，并确保文件首字符就是 '# '。")
     if "GitHub 项目类文章必须" in text:
         lessons.append("GitHub 项目类文章必须在开头 8 行内保留项目链接。")
+    if "output_file 重复" in text:
+        lessons.append("自动生成 deepread 时必须对 output_file 去重；同类泛化标题需要追加新闻关键词或序号。")
     if "超短段落比例偏高" in text:
         lessons.append("公众号成稿应合并连续超短段落，优先使用 2-4 句话组成一个自然段。")
     if "编辑评分低于发布门槛" in text:
@@ -412,8 +492,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     configure_console()
     args = parse_args()
-    if not AGENT_RULES.exists():
-        raise SystemExit("AGENT.md not found; pipeline needs the project rule contract.")
+    agent_rules = load_agent_rules()
     if not 3 <= args.article_count <= 5:
         raise SystemExit("--article-count must be between 3 and 5 to satisfy deepread rules.")
 
@@ -424,7 +503,7 @@ def main() -> None:
     deepread_path = REPORTS_DIR / f"{args.date}.deepread.json"
     results: list[StageResult] = []
 
-    print(f"Using rule contract: {project_path(AGENT_RULES)}")
+    print(f"Read rule contract: {project_path(AGENT_RULES)} ({len(agent_rules)} chars)")
 
     if not args.skip_fetch:
         results.append(
@@ -465,22 +544,11 @@ def main() -> None:
         write_error_log(args.date, results)
         raise SystemExit(results[-1].returncode)
 
-    results.append(
-        run_stage(
-            "verify articles",
-            [
-                sys.executable,
-                "verify_article.py",
-                "daily_paper",
-                "--deepread",
-                project_path(deepread_path),
-                "--verbose",
-            ],
-        )
-    )
-    if not results[-1].ok:
+    article_results = verify_selected_articles(deepread_path)
+    results.extend(article_results)
+    if not all(result.ok for result in article_results):
         write_error_log(args.date, results)
-        raise SystemExit(results[-1].returncode)
+        raise SystemExit(1)
 
     print("\nPipeline completed: report, deepread, articles, and all validations passed.")
 
