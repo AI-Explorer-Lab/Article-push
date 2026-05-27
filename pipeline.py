@@ -22,9 +22,11 @@ import os
 import re
 import subprocess
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from datetime import date, datetime
+from http.client import RemoteDisconnected
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -675,8 +677,19 @@ def call_llm_chat(messages: list[dict], llm_model: str | None, temperature: floa
         },
         method="POST",
     )
-    with urlopen(request, timeout=120) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            with urlopen(request, timeout=240) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            break
+        except (RemoteDisconnected, TimeoutError, URLError) as exc:
+            last_error = exc
+            if attempt == 3:
+                raise
+            time.sleep(attempt * 2)
+    else:
+        raise RuntimeError(f"LLM request failed: {last_error}")
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
@@ -695,7 +708,7 @@ def normalize_llm_article(content: str) -> str:
 def ensure_full_original_for_llm(context: dict, item: dict, max_chars: int) -> str:
     original_text = str(context.get("original_text") or "")
     status = context.get("status")
-    if status != "fetched" or chinese_char_count(original_text) < 300:
+    if status != "fetched" or len(original_text) < 300:
         raise RuntimeError(
             "LLM writer requires fetched full original text for each article; "
             f"got status={status!r} for {item.get('title', '')!r}."
