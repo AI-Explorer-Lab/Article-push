@@ -40,6 +40,13 @@ GENERIC_HEADING_PATTERNS = [
     r"^真实痛点",
 ]
 
+OVERUSED_TEMPLATE_PATTERNS = [
+    r"真正值得看的，不是标题里那一点热闹",
+    r"这条 AI 动态，真正值得看的是工程入口",
+    r"真正考验的是落地边界",
+    r"AI 进入真实研发流程的问题摆到了台前",
+]
+
 
 def chinese_char_count(text: str) -> int:
     return len(re.findall(r"[\u4e00-\u9fff]", text))
@@ -75,6 +82,17 @@ def infer_article_type(text: str) -> str | None:
 
 def has_any(text: str, keywords: list[str]) -> bool:
     return any(keyword in text for keyword in keywords)
+
+
+def covered_terms(text: str, terms: list[str]) -> list[str]:
+    covered: list[str] = []
+    for term in terms:
+        normalized = str(term).strip()
+        if len(normalized) < 3:
+            continue
+        if normalized in text:
+            covered.append(normalized)
+    return covered
 
 
 def verify_structure_by_type(text: str, article_type: str) -> tuple[list[str], list[str]]:
@@ -328,12 +346,26 @@ def verify_article(path: Path, deepread_item: dict | None = None) -> dict:
         if re.search(pattern, text):
             errors.append(f"最终 Markdown 出现禁止内容: {label}")
 
+    for pattern in OVERUSED_TEMPLATE_PATTERNS:
+        if re.search(pattern, text):
+            errors.append(f"最终 Markdown 出现旧模板化表达: {pattern}")
+
     if deepread_item:
         source_url = str(deepread_item.get("url", ""))
         if "github.com/" in source_url.lower():
             top_block = "\n".join(text.splitlines()[:8])
             if source_url not in top_block:
                 errors.append("GitHub 项目类文章必须在开头紧跟标题给出项目链接")
+        plan = deepread_item.get("article_plan") or {}
+        must_include = plan.get("must_include") or []
+        if must_include:
+            covered = covered_terms(text, must_include)
+            min_required = min(3, len(must_include))
+            if len(covered) < min_required:
+                errors.append(
+                    "文章没有覆盖足够的原文关键对象: "
+                    f"{len(covered)}/{len(must_include)}，至少需要 {min_required}"
+                )
 
     article_type = None
     if deepread_item:

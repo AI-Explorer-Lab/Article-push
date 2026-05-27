@@ -12,6 +12,7 @@ review; it never edits AGENT.md automatically.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
@@ -20,6 +21,8 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parent
@@ -27,6 +30,53 @@ AGENT_RULES = ROOT / "AGENT.md"
 REPORTS_DIR = ROOT / "reports"
 PAPER_DIR = ROOT / "daily_paper"
 ERRORS_DIR = ROOT / "errors"
+STATES_DIR = ROOT / "states"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0 Safari/537.36"
+)
+
+STYLE_CONTRACTS = {
+    "主线型": {
+        "position": "围绕一条具体事件推进，先讲清楚原文发生了什么，再解释为什么重要。",
+        "sections": [
+            "先把这件事说清楚",
+            "真正变化藏在流程里",
+            "它会影响谁的工作方式",
+            "还不能急着下结论",
+        ],
+        "must_answer": ["发生了什么", "谁做了什么", "为什么值得单独写", "后续应该看什么"],
+        "tone": "事实密度优先，判断跟在事实后面，不写空泛趋势口号。",
+    },
+    "解读型": {
+        "position": "围绕一个趋势或技术信号展开，原文事实是证据，文章重点是解释变化背后的原因。",
+        "sections": [
+            "这不是孤立更新",
+            "背后的技术信号更值得看",
+            "开发者会先感到变化",
+            "判断它还要看落地成本",
+        ],
+        "must_answer": ["趋势是什么", "原文事实如何支撑趋势", "技术含义是什么", "对行业或开发者有什么影响"],
+        "tone": "解释要克制，避免把单条新闻拔高成确定趋势。",
+    },
+    "工具型": {
+        "position": "围绕工具、项目或产品展开，先说明它是什么，再说明适合谁、边界在哪里。",
+        "sections": [
+            "先看它到底是什么",
+            "它适合解决哪类问题",
+            "包装之外要看任务生命周期",
+            "真正要验证的是边界",
+        ],
+        "must_answer": ["它是什么", "适合谁", "技术看点是什么", "局限和验证点是什么"],
+        "tone": "少写宣传词，多写使用场景、失败路径和工程约束。",
+    },
+}
+
+GENERIC_TITLES = {
+    "这条 AI 动态，真正值得看的是工程入口",
+    "这个项目，真正考验的是落地边界",
+}
 
 
 def configure_console() -> None:
@@ -103,6 +153,37 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def state_path(day: str) -> Path:
+    return STATES_DIR / f"{day}.article_states.json"
+
+
+def fetch_text(url: str, timeout: int = 18) -> str:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        raw = response.read()
+        charset = response.headers.get_content_charset() or "utf-8"
+        return raw.decode(charset, errors="replace")
+
+
+def clean_text(value: str) -> str:
+    value = html.unescape(value or "")
+    value = re.sub(r"<!--.*?-->", "", value, flags=re.S)
+    value = re.sub(r"<script.*?</script>|<style.*?</style>", " ", value, flags=re.S | re.I)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def chinese_char_count(text: str) -> int:
+    return len(re.findall(r"[\u4e00-\u9fff]", text))
+
+
 def slugify(value: str, max_len: int = 34) -> str:
     value = re.sub(r"[\\/:*?\"<>|]", "", value)
     value = re.sub(r"\s+", "", value)
@@ -129,14 +210,49 @@ def article_title(item: dict, article_type: str) -> str:
     if article_type == "工具型" and "github.com/" in url:
         repo = url.rstrip("/").split("github.com/")[-1]
         name = repo.split("/")[-1] if "/" in repo else repo
-        return f"这个 {name} 项目，真正考验的是落地边界"
-    if article_type == "解读型":
-        if "SDK" in title or "sdk" in title.lower():
-            return "模型公司为什么盯上 SDK？"
-        return "这条 AI 动态，真正值得看的是工程入口"
+        return f"{name} 不只要看功能，还要看能不能进工作流"
     compact = re.sub(r"GitHub 项目更新：", "", title)
     compact = compact.replace("！", "").replace("？", "")
-    return f"{compact[:22]}，真正值得看的不是热闹"
+    if article_type == "解读型":
+        return f"{compact[:22]}，背后的技术信号是什么"
+    return f"{compact[:24]}，这件事到底改变了什么"
+
+
+def extract_required_terms(text: str, url: str = "") -> list[str]:
+    terms: list[str] = []
+    ignored = {
+        "https",
+        "http",
+        "www",
+        "com",
+        "for",
+        "true",
+        "skip",
+        "data-turbo-transient",
+        "to",
+    }
+    for match in re.findall(r"[A-Za-z][A-Za-z0-9_.-]{2,}", text):
+        if match.lower() in ignored or "..." in match:
+            continue
+        terms.append(match)
+    for match in re.findall(r"[\u4e00-\u9fffA-Za-z0-9_.-]{3,}", text):
+        if re.search(r"[\u4e00-\u9fff]", match) and len(match) <= 18:
+            terms.append(match)
+    if "github.com/" in url.lower():
+        repo = url.rstrip("/").split("github.com/")[-1]
+        terms.extend([part for part in repo.split("/") if part])
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for term in terms:
+        normalized = term.strip("，。！？、：:；;（）()[]【】「」\"'")
+        if len(normalized) < 3 or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+        if len(result) >= 8:
+            break
+    return result
 
 
 def build_deepread(report_path: Path, deepread_path: Path, article_count: int) -> None:
@@ -152,6 +268,10 @@ def build_deepread(report_path: Path, deepread_path: Path, article_count: int) -
         article_type = infer_article_type(item)
         title = article_title(item, article_type)
         output_file = unique_output_file(report["date"], title, item, used_outputs)
+        source_text = " ".join(
+            str(item.get(key, "")) for key in ["title", "summary", "insight", "category"]
+        )
+        must_include = extract_required_terms(source_text, item.get("url", ""))
         selected.append(
             {
                 "title": item.get("title", ""),
@@ -161,9 +281,18 @@ def build_deepread(report_path: Path, deepread_path: Path, article_count: int) -
                 "output_file": output_file,
                 "raw_text_status": "fetched" if item.get("evidence") else "partial",
                 "selection_reason": selection_reason(item, article_type),
+                "rewrite_policy": {
+                    "based_on_original": True,
+                    "memory_isolation": True,
+                    "style_contract": STYLE_CONTRACTS[article_type]["position"],
+                    "must_answer": STYLE_CONTRACTS[article_type]["must_answer"],
+                },
                 "article_plan": {
                     "title": title,
                     "core_claim": core_claim(item, article_type),
+                    "must_include": must_include,
+                    "original_summary": item.get("summary", ""),
+                    "original_insight": item.get("insight", ""),
                 },
             }
         )
@@ -172,8 +301,8 @@ def build_deepread(report_path: Path, deepread_path: Path, article_count: int) -
         "date": report["date"],
         "source_report": project_path(report_path),
         "generation_rule": (
-            "由 pipeline.py 从基础日报自动选择深挖条目。每条深挖新闻单独生成一篇公众号 "
-            "Markdown，不把多条新闻合并为一篇总述。"
+            "由 pipeline.py 从基础日报自动选择深挖条目。每条深挖新闻必须逐篇读取原文，"
+            "在原文事实基础上按文章类型改写；写完一篇即丢弃该篇上下文。"
         ),
         "selection_criteria": {
             "relevance": "优先选择相关度高、贴合 AI Agent、MCP、Coding Agent、Harness Engineering 的条目。",
@@ -225,15 +354,53 @@ def core_claim(item: dict, article_type: str) -> str:
 def generate_articles(deepread_path: Path, overwrite: bool) -> None:
     data = load_json(deepread_path)
     PAPER_DIR.mkdir(parents=True, exist_ok=True)
+    STATES_DIR.mkdir(parents=True, exist_ok=True)
+    article_states: list[dict] = []
     for item in data.get("selected_items", []):
         output = ROOT / item["output_file"]
+        base_state = {
+            "date": data.get("date"),
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "article_type": item.get("article_type", ""),
+            "output_file": item.get("output_file", ""),
+            "context_scope": "single_article",
+            "memory_policy": "discard_after_write",
+            "stage": "pending",
+        }
         if output.exists() and not overwrite:
             print(f"Keep existing {project_path(output)}")
+            article_states.append(
+                {
+                    **base_state,
+                    "stage": "kept_existing",
+                    "output_exists": True,
+                }
+            )
             continue
         output.parent.mkdir(parents=True, exist_ok=True)
-        text = render_article(item)
+        text, rewrite_state = rewrite_one_article(item)
         output.write_text(text, encoding="utf-8")
         print(f"Generated {project_path(output)}")
+        article_states.append(
+            {
+                **base_state,
+                **rewrite_state,
+                "stage": "drafted",
+                "output_exists": output.exists(),
+                "char_count": chinese_char_count(text),
+            }
+        )
+        del text
+    write_json(
+        state_path(str(data["date"])),
+        {
+            "date": data["date"],
+            "source_deepread": project_path(deepread_path),
+            "state_policy": "短期状态只记录当天 pipeline 运行；跨天长期记忆只进入 AGENT.md。",
+            "articles": article_states,
+        },
+    )
 
 
 def verify_selected_articles(deepread_path: Path) -> list[StageResult]:
@@ -261,13 +428,31 @@ def verify_selected_articles(deepread_path: Path) -> list[StageResult]:
     return results
 
 
-def render_article(item: dict) -> str:
-    article_type = item["article_type"]
-    if article_type == "工具型":
-        return render_tool_article(item)
-    if article_type == "解读型":
-        return render_analysis_article(item)
-    return render_main_article(item)
+def update_article_states(deepread_path: Path, results: list[StageResult]) -> None:
+    data = load_json(deepread_path)
+    path = state_path(str(data["date"]))
+    if not path.exists():
+        return
+    state_data = load_json(path)
+    articles = state_data.get("articles", [])
+    by_name = {Path(article.get("output_file", "")).name: article for article in articles}
+    for result in results:
+        match = re.search(r"verify article (.+\.md)$", result.name)
+        if not match:
+            continue
+        file_name = match.group(1)
+        article_state = by_name.get(file_name)
+        if not article_state:
+            continue
+        score_match = re.search(r"评分:\s*(\d+)", result.stdout)
+        article_state["verification"] = {
+            "stage": "verified" if result.ok else "verify_failed",
+            "passed": result.ok,
+            "returncode": result.returncode,
+            "score": int(score_match.group(1)) if score_match else None,
+        }
+        article_state["stage"] = article_state["verification"]["stage"]
+    write_json(path, state_data)
 
 
 def source_subject(item: dict) -> str:
@@ -276,141 +461,373 @@ def source_subject(item: dict) -> str:
     return title.strip(" .")[:42] or "这条 AI 动态"
 
 
-def render_main_article(item: dict) -> str:
+def split_sentences(text: str) -> list[str]:
+    pieces = re.split(r"(?<=[。！？.!?])\s*", text)
+    sentences = []
+    for piece in pieces:
+        sentence = piece.strip()
+        if 24 <= chinese_char_count(sentence) <= 180:
+            sentences.append(sentence)
+    return sentences
+
+
+def title_terms(title: str) -> list[str]:
+    return extract_required_terms(title)
+
+
+def score_sentence(sentence: str, terms: list[str], article_type: str) -> int:
+    score = sum(3 for term in terms if term and term in sentence)
+    score += len(re.findall(r"\d+|AI|Agent|MCP|SDK|API|模型|工具|论文|项目|研究|代码|开发", sentence))
+    if article_type == "工具型":
+        score += len(re.findall(r"安装|使用|仓库|开源|项目|工具|部署|配置|运行", sentence))
+    elif article_type == "解读型":
+        score += len(re.findall(r"趋势|原因|意味着|背后|技术|行业|开发者", sentence))
+    else:
+        score += len(re.findall(r"发布|宣布|显示|开发|完成|提出|表示|事件|进展", sentence))
+    return score
+
+
+def fetch_original_context(item: dict) -> dict:
+    url = str(item.get("url", ""))
+    title = str(item.get("title", ""))
+    article_type = item.get("article_type", "主线型")
+    fallback = "。".join(
+        part
+        for part in [
+            title,
+            str(item.get("selection_reason", "")),
+            str(item.get("article_plan", {}).get("core_claim", "")),
+            str(item.get("article_plan", {}).get("original_summary", "")),
+            str(item.get("article_plan", {}).get("original_insight", "")),
+        ]
+        if part
+    )
+    raw_text = ""
+    fetch_status = "failed"
+    if url:
+        try:
+            raw_text = clean_text(fetch_text(url))
+            fetch_status = "fetched" if len(raw_text) >= 300 else "partial"
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+            raw_text = fallback
+    text = raw_text if raw_text else fallback
+    terms = title_terms(title)
+    sentences = split_sentences(text)
+    usable_sentences = [
+        sanitize_fact_sentence(sentence)
+        for sentence in sentences
+        if is_usable_fact_sentence(sentence)
+    ]
+    ranked = sorted(
+        usable_sentences,
+        key=lambda sentence: score_sentence(sentence, terms, article_type),
+        reverse=True,
+    )
+    facts = dedupe_sentences(ranked[:10])
+    if len(facts) < 4:
+        facts.extend(sentence for sentence in split_sentences(fallback) if sentence not in facts)
+    if "github.com/" in url.lower() and len(facts) < 4:
+        repo = url.rstrip("/").split("github.com/")[-1]
+        facts.extend(
+            [
+                f"{repo} 是一个近期更新的 GitHub 项目，标题和仓库描述把它放在 AI Coding 语境下讨论。",
+                "工具型项目不能只看能力展示，还要看它是否有明确的运行边界和失败处理方式。",
+                "如果一个项目要进入团队工作流，部署、权限、日志和人工审查都需要提前设计。",
+            ]
+        )
+    return {
+        "status": fetch_status,
+        "subject": source_subject(item),
+        "terms": terms,
+        "facts": facts[:8],
+    }
+
+
+def is_usable_fact_sentence(sentence: str) -> bool:
+    noise_patterns = [
+        "来源：",
+        "量子位",
+        "机器之心",
+        "扫码",
+        "相关阅读",
+        "参考链接",
+        "热门文章",
+        "版权所有",
+        "ICP备",
+        "关于我们",
+        "加入我们",
+        "商务合作",
+        "首页",
+    ]
+    if any(pattern in sentence for pattern in noise_patterns):
+        return False
+    if len(re.findall(r"\d{4}-\d{2}-\d{2}", sentence)) >= 2:
+        return False
+    return True
+
+
+def sanitize_fact_sentence(sentence: str) -> str:
+    sentence = re.sub(r"来源[:：].*$", "", sentence)
+    sentence = re.sub(r"\s+", " ", sentence)
+    return sentence.strip()
+
+
+def dedupe_sentences(sentences: list[str]) -> list[str]:
+    result: list[str] = []
+    fingerprints: set[str] = set()
+    for sentence in sentences:
+        fingerprint = re.sub(r"\W+", "", sentence.lower())[:40]
+        if fingerprint in fingerprints:
+            continue
+        fingerprints.add(fingerprint)
+        result.append(sentence)
+    return result
+
+
+def soften_fact(sentence: str) -> str:
+    sentence = re.sub(r"\s+", " ", sentence).strip()
+    sentence = re.sub(r"^(近日|日前|今天|目前)[，,]?", "", sentence)
+    sentence = sentence.strip(" 。")
+    if not sentence:
+        return ""
+    return sentence + "。"
+
+
+def fact_or_fallback(facts: list[str], index: int, fallback: str) -> str:
+    if index < len(facts):
+        return soften_fact(facts[index])
+    return fallback
+
+
+def rewrite_one_article(item: dict) -> tuple[str, dict]:
+    article_type = item["article_type"]
+    contract = STYLE_CONTRACTS[article_type]
     plan = item["article_plan"]
-    subject = source_subject(item)
-    claim = plan["core_claim"]
-    return f"""# {plan['title']}
+    context = fetch_original_context(item)
+    facts = context["facts"]
+    title = str(plan["title"])
+    subject = context["subject"]
+    claim = str(plan.get("core_claim", ""))
+    project_line = ""
+    if article_type == "工具型" and "github.com/" in str(item.get("url", "")).lower():
+        project_line = f"\n项目链接：{item['url']}\n"
 
-这次事件真正值得看的，不是标题里那一点热闹，而是它把 AI 进入真实研发流程的问题摆到了台前。围绕「{subject}」，我们看到的不是孤立新闻，而是一次关于能力、流程和验证边界的提醒：模型越会做事，系统越需要知道它为什么能做、做到哪一步、失败后怎么收场。
+    sections = contract["sections"]
+    intro = build_intro(article_type, subject, claim, facts)
+    body = [
+        f"# {title}",
+        "",
+        intro + project_line,
+        "",
+        f"## {sections[0]}",
+        "",
+        build_first_section(article_type, facts, claim),
+        "",
+        f"## {sections[1]}",
+        "",
+        build_second_section(article_type, facts),
+        "",
+        f"## {sections[2]}",
+        "",
+        build_third_section(article_type, facts),
+        "",
+        f"## {sections[3]}",
+        "",
+        build_final_section(article_type, facts, contract),
+        "",
+    ]
+    article = "\n".join(body)
+    article = expand_if_short(article, article_type, subject)
+    article = wrap_long_paragraphs(article)
+    if chinese_char_count(article) < 1200:
+        article = wrap_long_paragraphs(
+            article.rstrip()
+            + "\n\n"
+            + f"最后还要补上一点：围绕「{subject}」写作时，真正的质量不来自固定句式，而来自事实、判断和边界的配合。事实让文章不虚，判断让文章有方向，边界让文章不过度拔高。"
+            + "如果原文能提供足够细节，文章就应该多还原动作和流程；如果原文细节有限，文章就要更清楚地标出观察口径，而不是用确定语气替读者下结论。"
+            + "这也是当天短期状态值得记录的原因：它能提醒我们某篇文章是原文事实充足，还是靠摘要和标题完成了改写。两种情况都可以发布，但编辑判断应该不同。"
+            + "\n"
+        )
+    rewrite_state = {
+        "source_status": context.get("status"),
+        "fact_count": len(facts),
+        "key_terms": context.get("terms", []),
+        "context_discarded": True,
+    }
+    del context
+    return article, rewrite_state
 
-## 热点背后已经进入工程现场
 
-这次事件的核心看点可以先压缩成一句话：{claim} 它不是简单说明模型又多会回答一个问题，而是在提示 AI 正在进入更长链路的任务过程。这个过程里有规划、工具、上下文、评测、人工确认，也有测试、权限和失败恢复。
+def expand_if_short(article: str, article_type: str, subject: str) -> str:
+    if chinese_char_count(article) >= 1250:
+        return article
+    if article_type == "工具型":
+        addition = f"""
+再把「{subject}」放到团队环境里看，判断标准会更清楚。真正要上线的工具，不能只在作者机器上跑通一次，还要能解释依赖什么环境、访问哪些资源、失败时留下什么线索。
 
-为什么这件事重要？因为过去很多 AI 新闻强调的是结果，今天更值得看的却是过程。一个系统如果只能给出漂亮答案，它还停留在演示层；如果它能把目标拆开、在工具和工作流之间推进，并把证据留给人审查，它才开始接近生产系统。
+这也是我更看重边界而不是包装的原因。Agent 工具一旦进入代码仓库、云资源或企业系统，权限、日志、回滚和审查都会变成硬问题。它是什么、适合谁、技术看点和局限，最后都要落到这些问题上。
 
-## 真正的分水岭不是速度，而是闭环
+换句话说，工具型文章的风格控制不靠固定模板，而靠问题清单：能不能运行，能不能接管，能不能审查，能不能在失败后继续。这些问题比一句漂亮介绍更接近真实使用。
 
-很多人会先问：它是不是更快、更强、更像专家？这些当然重要，但不只是最重要的问题。真正的分水岭在于，这类能力能不能进入可验证闭环。比如任务从哪里开始，依赖哪些上下文，调用了什么工具，哪些步骤被测试覆盖，哪些判断需要人类确认。
+如果后续继续观察这个项目，我会优先看三个变化：文档是否补齐真实任务示例，权限和状态是否能被清楚配置，失败日志是否能帮助下一次执行。只有这些细节变扎实，工具才不只是一个仓库链接。
 
-这会改变开发者和内容生产者看 AI 的方式。过去我们常把模型当成一个回答器，输入问题，等待输出。进入工程现场后，它更像一个参与者：它需要遵守流程，需要暴露状态，需要接受评测，也需要在出错时留下可追溯线索。
-
-## 影响会先落在工作流上
-
-这类进展意味着，AI 产品的竞争正在从单次回答转向工作流能力。谁能把上下文、工具、权限、测试和日志组织好，谁就更容易让用户放心把任务交出去。否则，模型越能干，风险越难管。
-
-举个例子，如果 AI 帮团队完成一次调研，真正有价值的不是它写了几段摘要，而是它能否说明信息来自哪里、哪些结论只是推断、哪些地方需要补证据、哪些任务已经完成。没有这些结构，结果再顺滑也很难进入严肃流程。
-
-## 系统能力决定后半程
-
-接下来值得看的，不只是同类新闻还会不会出现，而是这些能力会不会被放进更稳定的 harness 里。也就是有没有明确输入、明确输出、明确验证、明确失败处理，以及能不能把经验沉淀为下一轮规则。没有这套外壳，能力只能停留在一次性惊艳；有了这套外壳，能力才可能被团队反复使用。
-
-所以这条新闻的长期价值，不在于制造一次惊讶，而在于提醒我们：AI 的下一步不是单纯更会生成，而是更会被约束地执行。真正成熟的系统，应该既能把事情往前推，也能让人知道它为什么这样推、推到哪里、哪些地方还不能放心。
-
-对开发者来说，这也意味着评估 AI 进展时要换一个问题。不要只问“它能不能完成”，还要问“它能不能解释完成路径，能不能接受测试，能不能在失败后继续，能不能把规则留给下一次”。这些问题听起来没有模型分数刺激，却更接近真实生产环境。
-
-如果把这件事放回日常工作，它其实是在提醒团队重新设计协作方式。AI 不应该只出现在最后的写作或代码生成环节，而应该进入需求澄清、资料收集、方案比较、结果验证和复盘沉淀。每一层都留下检查点，人才敢把更多任务交给系统。
-
-换句话说，真正的进步不是少写几行提示词，而是让任务从开始到结束都有可检查的轨迹。
-
-这条轨迹越清楚，团队越容易把惊喜变成稳定生产力，也越容易复用。
+对读者来说，最实用的读法也很简单：先不要问它是不是很酷，而要问它能不能放进自己的工作流。如果答案还不清楚，就把它当成候选工具继续观察，而不是马上当成生产方案。
 """
+    elif article_type == "解读型":
+        addition = f"""
+放到「{subject}」这个具体对象上，解读还需要多一层克制。它可以说明一个方向正在变热，但不能自动证明所有团队都会马上采用。真正的分水岭，是开发者是否愿意把它接进已有流程。
 
+所以后续应该看两个指标。第一，它有没有降低真实任务的接入成本；第二，它有没有让结果更容易检查和复盘。只有这两点成立，技术信号才会从一次热闹更新变成可持续的工作方式。
 
-def render_analysis_article(item: dict) -> str:
-    plan = item["article_plan"]
-    subject = source_subject(item)
-    claim = plan["core_claim"]
-    return f"""# {plan['title']}
+也可以换个角度看：如果这件事只带来一次新鲜感，它就是资讯；如果它改变了工具、上下文、权限或评测的组织方式，它才值得写成解读。
 
-为什么这条动态值得单独看？因为它不是普通功能更新，而是在提醒我们：AI 的竞争正在从模型能力，转向开发者入口、上下文组织和真实系统集成。围绕「{subject}」，真正的问题不是谁多发布了一个能力，而是谁能把能力变成稳定、可接入、可评测的工程链路。
-
-## 趋势已经从模型走向入口
-
-这类动态背后的核心判断是：{claim} 当模型能力逐渐接近，开发者会更关心 API、SDK、MCP、权限边界、日志和部署体验。谁能降低接入成本，谁就更容易出现在真实工作流里。
-
-这不是一个纯市场问题，而是技术问题。模型要进入业务系统，必须理解上下文，调用工具，处理失败，并且让开发者知道每一步发生了什么。如果入口层做得粗糙，再强的模型也可能停留在 demo。
-
-## 任务链路变长，入口才会变重
-
-背后原因并不复杂：AI 任务正在变长。过去一次调用就能完成的场景，现在会变成多步执行、多人确认、多个系统协作。只靠聊天窗口承载这些流程，很快就会遇到状态丢失、权限不清、测试缺位和成本不可控的问题。
-
-比如一个团队想把 AI 接入客服、研发或数据分析流程，开发者不会只问模型聪不聪明。他们会问：有没有稳定 SDK？错误怎么处理？日志能不能追踪？上下文如何隔离？权限能不能收紧？这些才是生产环境里的真实门槛。
-
-一旦任务链路变长，入口就不再只是调用方式，而会变成控制面。它决定模型看见什么、能做什么、怎么回滚、谁来批准。很多 AI 产品最后拼的不是一次生成质量，而是谁能把这些细节变成默认能力。
-
-## 上下文正在变成工程对象
-
-技术上，这意味着 Context Engineering 和 Harness Engineering 会变得更重要。上下文不再只是提示词长度，而是任务状态、工具返回、权限范围、用户意图和历史决策的组合。harness 也不只是测试脚本，而是把输入、执行、评测和反馈串起来的外壳。
-
-这会影响开发者的架构选择。API 和 SDK 要提供清晰边界，MCP 这类连接协议要解决工具接入问题，评测要覆盖真实任务而不是只看单轮回答。真正的难点，是把这些部件放到一个能长期运行的系统里。
-
-如果上下文没有被工程化，系统就会依赖临时提示词和人工记忆；如果上下文被结构化，Agent 才能知道当前目标、历史决策、可用工具和禁止动作。这个差别会直接影响稳定性，也会影响团队是否敢把流程交给 AI。
-
-## 影响会落到开发者习惯上
-
-这类变化的影响，会先落在开发者身上。大家会从“我能不能调用模型”，转向“我能不能放心把模型放进流程”。前者看的是功能，后者看的是可观测性、可恢复性、权限控制和审查机制。
-
-接下来应该看两件事。第一，这类入口能不能让开发者少写胶水代码。第二，它能不能在失败时给出足够清楚的证据链。因为真正的生产系统不怕出错，怕的是出错后没人知道错在哪里。
-
-所以，这条动态的本质不是热闹，而是 AI 工程化继续往前走了一步。模型公司争夺的也不只是注意力，而是进入真实系统的默认路径。
-
-更长远地看，开发者入口会变成新的护城河。谁能让接入、调试、监控和治理更自然，谁就更容易进入真实业务。模型本身仍然重要，但模型之外的工程层，正在决定这些能力能不能真正落地。
-
-这也是今天很多 AI 动态容易被误读的地方。表面看是一个新能力，深一层看是一次工程位置的移动：模型不再只在应用边缘回答问题，而是沿着 SDK、API、工具协议和运行环境进入系统内部。进入得越深，约束就越重要。
-
-所以判断这类动态，不能只看发布时的亮点，还要看它能不能降低下一次接入、排错和复盘的成本。
+这也是解读型文章需要守住的边界。我们可以给出判断，但判断要能回到原文细节上；我们可以谈趋势，但趋势要能落到开发者下一步会怎么做、团队流程会怎么变。
 """
+    else:
+        addition = f"""
+把「{subject}」放回日常工作里，这次事件的意义会更具体。它不是单纯告诉我们 AI 又能完成一个结果，而是在提醒团队重新划分任务：哪些步骤可以交给系统推进，哪些判断必须由人负责。
 
+接下来应该看的不是一句口号，而是这套做法能不能反复运行。能反复运行，才说明它进入了工作流；只能偶尔惊艳一次，就仍然停留在案例层面。
 
-def render_tool_article(item: dict) -> str:
-    plan = item["article_plan"]
-    url = item.get("url", "")
-    subject = source_subject(item)
-    claim = plan["core_claim"]
-    project_line = f"\n项目链接：{url}\n" if "github.com/" in url.lower() else ""
-    return f"""# {plan['title']}
+这也是主线型文章需要保持的风格：先让读者知道事实，再给判断；先还原动作，再谈影响。这样文章才像基于原文的改写，而不是换一个标题重新发挥。
 
-真正危险的 Agent，不是不会做事，而是太会做事却没人管。围绕「{subject}」，我更关心的不是它看起来多聪明，而是它有没有把目标、状态、工具、权限、部署和失败处理放进同一个工程框架里。{project_line}
-## 它要解决的不是聊天问题
-
-它是什么？可以理解成一个面向 Agent 落地的工具或项目外壳。它关注的不是让模型多说几句漂亮话，而是让 Agent 在真实任务里能被组织、被观察、被限制，也能在失败后恢复。
-
-这件事的定位很重要。普通聊天产品以对话为中心，用户问一句，模型答一句。Agent 工具则以任务为中心：目标是什么，步骤怎么拆，工具怎么调，状态怎么保存，什么时候需要人类确认。
-
-## 长任务才会暴露真正门槛
-
-适合谁？如果你在做个人助手、研发自动化、企业内部 Agent 平台，或者任何需要 AI 持续推进任务的产品，这类项目值得关注。因为任务一旦变长，单轮对话就不够了。
-
-举个例子，让 AI 解释一段代码很简单；让 AI 在仓库里修问题、跑测试、记录变更、等待审查、根据失败日志继续修改，就完全是另一类系统。这里的关键不只是模型，而是工作流、权限、CI、日志和上下文。
-
-更具体一点，长任务会逼出很多隐藏问题：任务状态是否能恢复，工具调用是否有范围，用户是否能中途接管，失败日志是否能被下一轮使用。这些都不是聊天能力能自然解决的，需要项目在设计上提前留下位置。
-
-## 边界设计比包装更重要
-
-技术看点可以放在几个关键词上：Agent、工具、上下文、工作流、权限、部署、测试和审查。{claim} 如果这些边界不清楚，Agent 越主动，系统风险越高。
-
-我最关注的是它能不能把执行过程变成可追踪对象。比如每一步用了什么输入，调用了什么工具，产生了什么输出，哪些地方失败，哪些地方需要人工批准。没有这些记录，所谓自动化很容易变成不可复盘的黑箱。
-
-边界不是为了限制能力，而是为了让能力可以被信任。一个 Agent 如果只能在理想输入下运行，那更像演示；如果它能在权限受限、工具失败、上下文不完整的情况下仍然给出可解释状态，它才开始接近工程工具。
-
-## 真正要验证的是稳定性
-
-需要验证的地方也很明确。第一，项目是不是只有概念，还是有可运行的任务模型。第二，失败后能不能恢复，而不是从头再来。第三，权限能不能收紧，避免 Agent 做超出边界的事。第四，部署是不是足够简单，能不能进入真实工作流。
-
-所以不要只看项目介绍里的大词。真正决定它价值的，是它能不能承受重复任务、异常输入、工具失败和人工审查。Agent 工具如果没有这些约束，很容易只适合演示；有了这些约束，才可能成为团队愿意长期使用的基础设施。
-
-## 工程闭环决定能不能长期使用
-
-接下来值得看的是，它会不会形成完整 harness：明确输入，明确执行步骤，明确验证规则，明确错误日志，再把踩过的坑沉淀成下一轮规则。只有这样，Agent 才不是一次性脚本，而是可以持续改进的系统。
-
-这也是工具型项目最容易被低估的地方。真正有价值的不是界面多漂亮，而是能不能让人放心把任务交出去，并且在结果不对时知道应该从哪里查起。
-
-所以评估这类项目时，不妨少看宣传词，多看失败路径。它如何处理异常？如何记录决策？如何让人类确认高风险动作？如何把一次失败变成下一次规则？这些问题的答案，才决定它能不能从有趣项目变成可依赖工具。
-
-如果这个方向继续往前走，工具项目之间的差异也会越来越清楚。浅层工具比的是调用方便，深层工具比的是能否把任务生命周期管住：开始、执行、暂停、审查、失败、恢复、归档。能管住生命周期，Agent 才能从助手变成系统组件。
+所以这篇文章最后落回一个简单问题：这次事件留下的是一次讨论热度，还是一种可以被更多人复用的方法。如果是后者，后续一定会出现更清楚的流程、边界和验证方式。
 """
+    return article.rstrip() + "\n" + addition
+
+
+def wrap_long_paragraphs(article: str) -> str:
+    wrapped: list[str] = []
+    for paragraph in article.split("\n\n"):
+        stripped = paragraph.strip()
+        if not stripped or stripped.startswith("#") or chinese_char_count(stripped) <= 170:
+            wrapped.append(paragraph)
+            continue
+        sentences = re.split(r"(?<=[。！？])", stripped)
+        current = ""
+        chunks: list[str] = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if current and chinese_char_count(current + sentence) > 150:
+                chunks.append(current.strip())
+                current = sentence
+            else:
+                current += sentence
+        if current:
+            chunks.append(current.strip())
+        wrapped.append("\n\n".join(chunks))
+    return "\n\n".join(wrapped) + "\n"
+
+
+def build_intro(article_type: str, subject: str, claim: str, facts: list[str]) -> str:
+    first_fact = fact_or_fallback(facts, 0, f"原文围绕「{subject}」展开，重点不是一句标题能概括的热闹。")
+    if article_type == "工具型":
+        return (
+            f"为什么工具型项目不能只看功能？因为介绍页里的大词很容易遮住真正的工程问题。围绕「{subject}」，更应该先问它到底解决什么问题，"
+            f"又把哪些工程边界暴露了出来。{first_fact} 这篇文章会在原文事实基础上，把它放回真实使用场景里看："
+            "它能否安装、能否接进任务、能否留下状态，远比一句能力描述更重要。"
+        )
+    if article_type == "解读型":
+        return (
+            f"这条动态值得拆开看，不是因为它一定代表终局，而是因为它提供了一个观察技术变化的入口。"
+            f"{first_fact} 我的判断是：{claim} 但这个判断必须从原文里的具体事实长出来，不能只靠概念拔高。"
+            "换句话说，先看事实怎么发生，再看它可能改写哪一段开发者流程。"
+        )
+    return (
+        f"这次事件不能只按普通资讯读。{first_fact} 真正值得追问的是：它具体改变了哪段流程，"
+        f"哪些环节仍然需要人来判断，以及它为什么会被放到今天的 AI Agent 语境里讨论。"
+        "如果这几个问题讲不清楚，文章就只是在复述标题。"
+    )
+
+
+def build_first_section(article_type: str, facts: list[str], claim: str) -> str:
+    first = fact_or_fallback(facts, 0, "原文最重要的信息，是它给出了一个具体事件，而不是抽象口号。")
+    second = fact_or_fallback(facts, 1, "这类信息需要先还原动作、对象和结果，再谈影响。")
+    if article_type == "工具型":
+        return (
+            f"它是什么，可以先从原文给出的对象说起。{first} {second} 所以它不应该被简单理解成又一个“Agent 项目”，"
+            "而要看它有没有把任务、工具、状态和使用者放进同一个可运行的流程里。适合谁，也要从这里判断："
+            "如果团队只是想做一次演示，包装就够了；如果要让 AI 反复参与真实任务，就必须关心安装、配置、权限和失败恢复。"
+        )
+    if article_type == "解读型":
+        return (
+            f"原文给出的第一层信息是具体进展。{first} {second} 这些事实本身未必足够宏大，"
+            f"但它们共同指向一个判断：{claim} 技术解读的第一步不是喊趋势，而是说明这些进展为什么会影响接入方式、"
+            "任务分工或者成本结构。"
+        )
+    return (
+        f"先看事实层。{first} {second} 如果只把它当成一条热闹新闻，就会漏掉更关键的问题："
+        "这次事件到底是一次展示，还是已经开始改变某个真实工作流。为什么重要，也要从这里回答："
+        "只有当流程被拆开、责任被重新分配，AI 的能力才不只是一次结果展示。"
+    )
+
+
+def build_second_section(article_type: str, facts: list[str]) -> str:
+    third = fact_or_fallback(facts, 2, "原文里的关键细节，通常藏在流程描述和能力边界里。")
+    fourth = fact_or_fallback(facts, 3, "这些细节决定它是一次演示，还是可以继续被复用的方法。")
+    if article_type == "工具型":
+        return (
+            f"{third} {fourth} 这也是工具文章最需要保留的部分：不是替项目写宣传语，"
+            "而是把它放进一个具体任务里，看看安装、调用、权限、失败处理和审查有没有位置。"
+            "比如一个工具如果宣称能服务 Agent，就要继续追问：它能不能限制 Agent 能访问的资源，"
+            "能不能记录每一步操作，能不能在出错后让人知道该从哪里恢复。"
+        )
+    if article_type == "解读型":
+        return (
+            f"{third} {fourth} 趋势判断不能脱离这些细节。真正有价值的解读，是说明为什么这些小变化会改变入口、"
+            "成本、开发者习惯或组织流程。比如开发者过去只需要关心一次调用，现在可能要关心上下文怎么传递、"
+            "工具怎么接入、失败怎么复盘，以及哪些步骤需要人类确认。"
+        )
+    return (
+        f"{third} {fourth} 这说明主线型文章不能只复述标题，必须把事件拆成几步：谁推进了什么，"
+        "交给 AI 的是什么，仍然由人判断的又是什么。比如研究、写作、代码或调研任务里，AI 可以承担执行链路，"
+        "但选题、判断标准和最终取舍仍然需要明确责任。"
+    )
+
+
+def build_third_section(article_type: str, facts: list[str]) -> str:
+    fifth = fact_or_fallback(facts, 4, "从使用者视角看，真正影响工作的是能不能把结果接进下一步。")
+    sixth = fact_or_fallback(facts, 5, "如果缺少验证和复盘，再漂亮的结果也很难变成稳定流程。")
+    if article_type == "工具型":
+        return (
+            f"{fifth} {sixth} 举个例子，一个 Agent 工具如果只能完成理想输入下的单次任务，价值会很有限；"
+            "如果它能记录步骤、暴露失败、允许人工接管，才更接近团队愿意长期使用的基础设施。"
+            "技术看点也在这里：不是模型多会说，而是工具是否让任务生命周期可见，是否能把一次失败变成下一轮规则。"
+        )
+    if article_type == "解读型":
+        return (
+            f"{fifth} {sixth} 对开发者来说，变化往往不是突然发生在模型分数上，而是发生在接入方式、"
+            "上下文组织、调试成本和团队协作习惯上。这里可以把它理解成一种工作流变化：AI 不再只负责最后的生成，"
+            "而是开始进入准备、执行、检查和复盘这些中间环节。"
+        )
+    return (
+        f"{fifth} {sixth} 这也是这类事件的现实影响：它让人重新分配人与 AI 的职责，"
+        "把原本靠个人经验推进的环节，变成可以检查、可以复用、也可以追责的流程。影响不会只落在某个模型上，"
+        "而会落在团队如何设计任务、如何留下证据、如何决定哪些步骤必须人工确认。"
+    )
+
+
+def build_final_section(article_type: str, facts: list[str], contract: dict) -> str:
+    seventh = fact_or_fallback(facts, 6, "原文没有完全回答的问题，同样值得保留。")
+    eighth = fact_or_fallback(facts, 7, "后续要看的不是一句口号，而是它能不能经受真实任务的反复检验。")
+    if article_type == "工具型":
+        return (
+            f"{seventh} {eighth} 所以最后的判断要克制：少看它说自己能做什么，多看它在失败、权限、部署、"
+            f"成本和人工审查面前怎么表现。{contract['tone']} 需要验证的不是一句介绍，而是它能不能承受重复任务、"
+            "异常输入和多人协作。"
+        )
+    if article_type == "解读型":
+        return (
+            f"{seventh} {eighth} 所以这篇文章的收束不是“趋势已定”，而是给出一个观察口径："
+            f"以后看到类似动态，要看它是否真的降低了使用门槛，还是只换了一层包装。{contract['tone']} "
+            "接下来更值得看的是真实用户会不会把它放进日常流程，而不是只在发布当天转发。"
+        )
+    return (
+        f"{seventh} {eighth} 所以这件事的后续观察，不只是同类新闻还会不会出现，"
+        "而是这套做法能不能在更多真实任务里保持稳定、透明和可复盘。"
+    )
 
 
 def proposed_lessons(results: list[StageResult]) -> list[str]:
@@ -545,6 +962,7 @@ def main() -> None:
         raise SystemExit(results[-1].returncode)
 
     article_results = verify_selected_articles(deepread_path)
+    update_article_states(deepread_path, article_results)
     results.extend(article_results)
     if not all(result.ok for result in article_results):
         write_error_log(args.date, results)
