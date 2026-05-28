@@ -1,12 +1,12 @@
-"""verify_deepread.py - 深度阅读中间文件验证脚本"""
-
-from __future__ import annotations
+"""src/validators/verify_deepread.py - 深度阅读中间文件验证脚本"""
 
 import json
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
+
+from src.common.verifier import VerifierResult
 
 
 VALID_ARTICLE_TYPES = {"主线型", "解读型", "工具型"}
@@ -21,26 +21,33 @@ def load_json(path: Path) -> tuple[dict | None, list[str]]:
         return None, [f"JSON 格式错误: {exc}"]
 
 
-def verify_deepread(file_path: str) -> tuple[bool, list[str], list[str]]:
+def verify_deepread(file_path: str | Path) -> VerifierResult:
+    """验证 deepread JSON 文件的结构合法性。
+
+    可通过 import 直接调用，也可通过 CLI 使用。
+    """
     errors: list[str] = []
     warnings: list[str] = []
 
     path = Path(file_path)
     if not path.exists():
-        return False, [f"文件不存在: {file_path}"], []
+        return VerifierResult(
+            passed=False,
+            errors=[f"文件不存在: {file_path}"],
+        )
     if path.suffix != ".json":
         errors.append(f"文件扩展名应为 .json: {path.name}")
 
     data, json_errors = load_json(path)
     if json_errors:
-        return False, json_errors, warnings
+        return VerifierResult(passed=False, errors=json_errors)
     assert data is not None
 
     for key in ["date", "source_report", "selected_items"]:
         if key not in data or not data[key]:
             errors.append(f"缺少或为空的顶层字段: {key}")
     if errors:
-        return False, errors, warnings
+        return VerifierResult(passed=False, errors=errors, warnings=warnings)
 
     date_value = str(data.get("date", ""))
     try:
@@ -63,7 +70,7 @@ def verify_deepread(file_path: str) -> tuple[bool, list[str], list[str]]:
     items = data.get("selected_items")
     if not isinstance(items, list):
         errors.append("selected_items 必须是数组")
-        return False, errors, warnings
+        return VerifierResult(passed=False, errors=errors, warnings=warnings)
 
     if not 3 <= len(items) <= 5:
         errors.append(f"selected_items 数量应为 3-5 条，当前为 {len(items)} 条")
@@ -137,30 +144,36 @@ def verify_deepread(file_path: str) -> tuple[bool, list[str], list[str]]:
         if 0 < len(reason) < 20:
             warnings.append(f"{tag} selection_reason 过短，难以支撑编辑判断")
 
-    return len(errors) == 0, errors, warnings
+    passed = len(errors) == 0
+    return VerifierResult(
+        passed=passed,
+        errors=errors,
+        warnings=warnings,
+        extra={"item_count": len(items)},
+    )
 
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("用法: python verify_deepread.py <reports/YYYY-MM-DD.deepread.json>")
+        print("用法: python -m src.validators.verify_deepread <reports/YYYY-MM-DD.deepread.json>")
         sys.exit(1)
 
-    passed, errors, warnings = verify_deepread(sys.argv[1])
+    result = verify_deepread(sys.argv[1])
 
     print(f"\n{'=' * 50}")
     print(f"开始验证 deepread: {sys.argv[1]}")
     print(f"{'=' * 50}\n")
 
-    for msg in errors:
+    for msg in result.errors:
         print(f"ERROR: {msg}")
-    for msg in warnings:
+    for msg in result.warnings:
         print(f"WARN: {msg}")
 
     print(f"\n{'=' * 50}")
-    if passed:
-        print(f"deepread 验证通过，共 {len(warnings)} 个警告。")
+    if result.passed:
+        print(f"deepread 验证通过，共 {len(result.warnings)} 个警告。")
         sys.exit(0)
-    print(f"deepread 验证失败：{len(errors)} 个错误，{len(warnings)} 个警告。")
+    print(f"deepread 验证失败：{len(result.errors)} 个错误，{len(result.warnings)} 个警告。")
     sys.exit(1)
 
 

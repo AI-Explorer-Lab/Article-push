@@ -1,4 +1,4 @@
-"""verify_article.py - daily_paper Markdown 成稿验证与编辑评分脚本"""
+"""src/validators/verify_article.py - daily_paper Markdown 成稿验证与编辑评分脚本"""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import json
 import re
 import sys
 from pathlib import Path
+
+from src.common.verifier import VerifierResult
 
 
 VALID_ARTICLE_TYPES = {"主线型", "解读型", "工具型"}
@@ -199,25 +201,12 @@ def score_article(text: str, title: str, article_type: str | None) -> tuple[int,
         suggestions.append("小标题模板感较重，建议让标题带出具体判断，而不是只标功能区块。")
     elif generic_headings > 0:
         scores["storyline"] -= generic_headings
-        suggestions.append("部分二级标题暴露了写作结构标签，建议把“发生了什么/为什么重要”等融入具体判断。")
+        suggestions.append("部分二级标题暴露了写作结构标签，建议把\"发生了什么/为什么重要\"等融入具体判断。")
 
     technical_terms = [
-        "Agent",
-        "MCP",
-        "harness",
-        "Context Engineering",
-        "Harness Engineering",
-        "SDK",
-        "API",
-        "RAG",
-        "CI",
-        "模型",
-        "工具",
-        "上下文",
-        "评测",
-        "工作流",
-        "权限",
-        "路由",
+        "Agent", "MCP", "harness", "Context Engineering", "Harness Engineering",
+        "SDK", "API", "RAG", "CI", "模型", "工具", "上下文", "评测", "工作流",
+        "权限", "路由",
     ]
     term_hits = sum(1 for term in technical_terms if term in text)
     if term_hits < 4:
@@ -296,6 +285,10 @@ def score_article(text: str, title: str, article_type: str | None) -> tuple[int,
 
 
 def verify_article(path: Path, deepread_item: dict | None = None) -> dict:
+    """验证单篇 Markdown 文章。
+
+    可通过 import 直接调用，返回包含 passed/errors/warnings/score 等字段的 dict。
+    """
     errors: list[str] = []
     warnings: list[str] = []
 

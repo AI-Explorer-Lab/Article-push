@@ -40,13 +40,14 @@
 
 ## 关注领域
 条目必须匹配至少一个领域：
-- AI Agent / Agentic AI
-- Harness Engineering / Context Engineering
-- MCP (Model Context Protocol)
-- LLM 推理与优化
-- AI Coding / Vibe Coding
+- AI Agent（涵盖 Agentic AI、Multi-Agent 等）
+- Harness Engineering
+- Context Engineering
+- MCP（Model Context Protocol）
+- LLM推理与优化
 - 多模态大模型
-- Codex / Claude Code / OpenAI / Anthropic
+- AI Coding（涵盖 Codex、Claude Code、GitHub Copilot 等）
+- Vibe Coding
 
 ## 输出格式要求
 基础日报输出为 `reports/YYYY-MM-DD.json`，结构如下：
