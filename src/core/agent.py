@@ -319,20 +319,35 @@ def fetch_sogou_wechat_legacy(account_name: str, query: str, logs: list[FetchLog
     skipped_no_date = 0
     for block in blocks:
         title_match = re.search(r'id="sogou_vr_11002601_title_\d+"[^>]*>(.*?)</a>', block, re.S)
-        href_match = re.search(r'<a[^>]+href="([^"]+)"[^>]+id="sogou_vr_11002601_title_\d+"', block, re.S)
+        # href 可能在 id 前面或后面，用更宽松的匹配
+        href_match = re.search(r'href="(/link\?url=[^"]+)"', block, re.S)
         summary_match = re.search(r'<p class="txt-info"[^>]*>(.*?)</p>', block, re.S)
-        ts_match = re.search(r'timeConvert\(\s*"?(?P<ts>\d{10})', html_text[html_text.find(block):html_text.find(block) + 4000])
+
         if not title_match or not href_match:
             continue
+
+        # 搜狗新格式: timeConvert('1771042006') 单引号
+        block_start = html_text.find(block)
+        surrounding = html_text[block_start:block_start + 5000]
+        ts_match = re.search(r"timeConvert\(\s*['\"]?(?P<ts>\d{10})", surrounding)
         if ts_match:
             published_at = datetime.fromtimestamp(int(ts_match.group("ts"))).strftime("%Y-%m-%d")
         else:
-            date_match = re.search(r"(\d{4}-\d{2}-\d{2})", clean_text(title_match.group(1)) + " " + clean_text(block))
-            if not date_match:
-                skipped_no_date += 1
-                continue
-            published_at = date_match.group(1)
-        title = clean_text(title_match.group(1))[:80] or f"{account_name} 鏂囩珷"
+            # 从标题和摘要中尝试提取中文日期格式
+            combined = clean_text(title_match.group(1)) + " " + clean_text(summary_match.group(1) if summary_match else "")
+            date_match = re.search(r"(\d{4})[\u5e74\-\/](\d{1,2})[\u6708\-\/](\d{1,2})[\u65e5]?", combined)
+            if date_match:
+                published_at = f"{date_match.group(1)}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
+            else:
+                # 只匹配年份的宽松策略
+                year_match = re.search(r"(\d{4})[\u5e74]", combined)
+                if year_match:
+                    published_at = f"{year_match.group(1)}-01-01"
+                else:
+                    skipped_no_date += 1
+                    continue
+
+        title = clean_text(title_match.group(1))[:80] or f"{account_name} 文章"
         snippet = clean_text(summary_match.group(1))[:200] if summary_match else ""
         candidates.append(
             Candidate(
