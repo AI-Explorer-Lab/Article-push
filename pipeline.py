@@ -661,12 +661,18 @@ def require_llm_config(llm_model: str | None) -> tuple[str, str, str]:
     return api_base, api_key, model
 
 
-def call_llm_chat(messages: list[dict], llm_model: str | None, temperature: float = 0.45) -> str:
+def call_llm_chat(
+    messages: list[dict],
+    llm_model: str | None,
+    temperature: float = 0.45,
+    max_tokens: int = 4096,
+) -> str:
     api_base, api_key, model = require_llm_config(llm_model)
     payload = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
+        "max_tokens": max_tokens,
     }
     request = Request(
         f"{api_base}/chat/completions",
@@ -705,6 +711,59 @@ def normalize_llm_article(content: str) -> str:
     return content.rstrip() + "\n"
 
 
+def polish_llm_article(content: str, article_type: str) -> str:
+    replacements = {
+        "真正值得看的不是": "需要关注的不是",
+        "真正值得看的，不是": "需要关注的，不是",
+        "真正值得看": "需要关注",
+        "真正考验": "关键考验",
+        "背后的技术信号": "其中的技术信号",
+        "这条动态值得拆开看": "这条动态适合按工程链路拆开看",
+        "不只要看功能": "还要看接入与验证",
+        "不能只看功能": "需要同时看接入与验证",
+        "这件事到底改变了什么": "它改动了哪段流程",
+        "最后落回一个简单问题": "最后要回到可复用性",
+        "放回日常工作里": "放到具体团队流程里",
+        "上下文来源：": "上下文入口：",
+        "三类上下文来源：": "三类上下文入口：",
+    }
+    for old, new in replacements.items():
+        content = content.replace(old, new)
+    content = re.sub(r"真正([^。！？\n]{0,20})不是([^。！？\n]{0,60})而是", r"关键\1不在于\2，而在于", content)
+
+    heading_replacements = {
+        "主线型": {
+            "为什么重要": "影响开始落到分发和决策链路",
+            "接下来怎么看": "后续要看闭环是否跑通",
+            "后续观察": "后续要看闭环是否跑通",
+        },
+        "解读型": {
+            "背后原因": "机制变化落在接入方式",
+            "技术含义": "工程含义落在上下文和接口",
+            "接下来": "落地还要看成本和复盘",
+        },
+        "工具型": {
+            "它是什么": "定位先从任务入口说清楚",
+            "适合谁": "适用人群取决于任务约束",
+            "技术看点": "快照、状态和门禁决定可用性",
+            "局限": "边界要放到失败场景里验证",
+            "需要验证": "边界要放到失败场景里验证",
+        },
+    }
+    mapping = heading_replacements.get(article_type, {})
+    lines = []
+    for line in content.splitlines():
+        if line.startswith("## "):
+            heading = line[3:].strip()
+            for marker, replacement in mapping.items():
+                if heading.startswith(marker):
+                    heading = replacement
+                    break
+            line = f"## {heading}"
+        lines.append(line)
+    return wrap_long_paragraphs("\n".join(lines))
+
+
 def ensure_full_original_for_llm(context: dict, item: dict, max_chars: int) -> str:
     original_text = str(context.get("original_text") or "")
     status = context.get("status")
@@ -729,6 +788,20 @@ def build_llm_writer_prompt(item: dict, context: dict, original_text: str) -> li
     github_note = ""
     if article_type == "工具型" and "github.com/" in str(item.get("url", "")).lower():
         github_note = f"- 这是 GitHub/开源项目文章，标题后 8 行内必须保留项目链接：{item.get('url')}\n"
+    type_checklist = {
+        "主线型": (
+            "- 主线型必须自然覆盖：事实切入、为什么重要、影响或改变、后续观察。\n"
+            "- 正文里要出现“这次事件”或“这次进展”，并明确写出“影响”与“接下来/后续”。\n"
+        ),
+        "解读型": (
+            "- 解读型必须自然覆盖：信号边界、机制解释、技术含义、影响判断。\n"
+            "- 正文里要出现“信号/边界/观察”之一，“接入方式/机制/流程/成本结构”之一，以及“技术/上下文/API/SDK/MCP/harness”之一。\n"
+        ),
+        "工具型": (
+            "- 工具型必须自然覆盖：工具定义、适合人群、技术看点、局限提醒。\n"
+            "- 正文里要出现“技术看点”，也要出现“局限/风险/需要验证/谨慎”之一，但不要把二级标题直接写成“技术看点”。\n"
+        ),
+    }.get(article_type, "")
     system = (
         "你是严谨的技术公众号编辑。你只能基于用户提供的原文全文写作，"
         "不得联网，不得添加原文没有的事实，不得把标题、关键词或摘要当作事实来源。"
@@ -741,10 +814,13 @@ def build_llm_writer_prompt(item: dict, context: dict, original_text: str) -> li
 - 当前文章写完后，原文上下文会被丢弃；不要引用上一篇或其他文章的信息。
 - Markdown 必须以一个一级标题开头，且只能有一个一级标题。
 - 至少 3 个二级标题，二级标题必须写成具体判断。
-- 中文正文 1000-1800 字。
+- 中文正文 1300-1800 字，不能短于 1200 字。
+- 段落以 2-4 句话为主，避免大量单句短段落。
+- 至少写一个具体例子或类比，使用“比如”或“举个例子”自然展开。
 - 不写“参考来源”“来源”“据某媒体报道”等归因区块。
 - 不写“真正值得看”“背后的技术信号”“这条动态值得拆开看”“不只要看功能”等模板腔。
 {github_note}
+{type_checklist}
 文章类型：{article_type}
 类型写法：{contract.get("position", "")}
 必须回答：{"；".join(contract.get("must_answer", []))}
@@ -772,6 +848,7 @@ def rewrite_one_article_with_llm(
         build_llm_writer_prompt(item, context, original_text),
         llm_model=llm_model,
     )
+    article = polish_llm_article(article, str(item.get("article_type", "")))
     rewrite_state = {
         "writer": "llm",
         "source_status": context.get("status"),
@@ -901,15 +978,25 @@ def build_llm_revision_prompt(
     errors = "\n".join(f"- {msg}" for msg in verification.get("errors", [])) or "- 无"
     warnings = "\n".join(f"- {msg}" for msg in verification.get("warnings", [])) or "- 无"
     suggestions = "\n".join(f"- {msg}" for msg in verification.get("rewrite_suggestions", [])) or "- 无"
+    article_type = item.get("article_type", "")
+    type_checklist = {
+        "主线型": "自然补齐：事实切入、为什么重要、影响或改变、后续观察；正文需要有“这次事件/这次进展”“影响”“接下来/后续”。",
+        "解读型": "自然补齐：信号边界、机制解释、技术含义、影响判断；正文需要有“信号/边界/观察”“接入方式/机制/流程/成本结构”“技术/上下文/API/SDK/MCP/harness”。",
+        "工具型": "自然补齐：工具定义、适合人群、技术看点、局限提醒；正文需要有“技术看点”和“局限/风险/需要验证/谨慎”。",
+    }.get(article_type, "")
     user = f"""请修订下面的 Markdown 文章，让它通过校验。
 
 硬性规则：
 - 只能基于原文全文修订，不允许新增事实。
 - 保留一个一级标题，至少 3 个二级标题。
+- 中文正文 1300-1800 字，不能短于 1200 字。
+- 段落以 2-4 句话为主，避免大量单句短段落。
+- 至少写一个具体例子或类比，使用“比如”或“举个例子”自然展开。
+- {type_checklist}
 - 不写“真正值得看”“背后的技术信号”“这条动态值得拆开看”“不只要看功能”等模板腔。
 - 直接输出完整 Markdown，不要解释。
 
-文章类型：{item.get("article_type", "")}
+文章类型：{article_type}
 原文标题：{item.get("title", "")}
 原文 URL：{item.get("url", "")}
 
@@ -955,6 +1042,7 @@ def revise_article_with_llm_until_valid(
             llm_model=llm_model,
             temperature=0.35,
         )
+        revised = polish_llm_article(revised, str(item.get("article_type", "")))
         output.write_text(revised, encoding="utf-8")
         current_text = revised
         rewrite_state["original_char_count"] = context.get("original_char_count", 0)
