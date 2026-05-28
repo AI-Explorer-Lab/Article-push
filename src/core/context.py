@@ -140,6 +140,8 @@ def fetch_original_context(item: dict) -> dict:
 
     返回 dict 包含 status, subject, terms, facts, original_text 等字段。
     原文全文仅在 local context 中存在，调用方用完必须丢弃。
+
+    微信文章优先使用 Selenium 浏览器抓取（绕过反爬）。
     """
     url = str(item.get("url", ""))
     title = str(item.get("title", ""))
@@ -158,12 +160,29 @@ def fetch_original_context(item: dict) -> dict:
     raw_text = ""
     fetch_status = "failed"
     if url:
-        try:
-            raw_text = clean_text(fetch_text(url))
-            fetch_status = "fetched" if len(raw_text) >= 300 else "partial"
-        except (HTTPError, URLError, TimeoutError, ValueError, OSError):
-            raw_text = fallback
-            fetch_status = "failed"
+        # 微信文章：优先使用 Selenium 浏览器抓取
+        if "mp.weixin.qq.com" in url:
+            try:
+                from src.infrastructure.browser_fetcher import (
+                    create_browser, fetch_wechat_article,
+                )
+                with create_browser(headless=True) as driver:
+                    browser_text = fetch_wechat_article(driver, url)
+                    if browser_text and len(browser_text) >= 300:
+                        raw_text = browser_text
+                        fetch_status = "fetched"
+            except Exception:
+                pass
+
+        # urllib 回退（或非微信文章）
+        if fetch_status == "failed":
+            try:
+                raw_text = clean_text(fetch_text(url))
+                fetch_status = "fetched" if len(raw_text) >= 300 else "partial"
+            except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+                raw_text = fallback
+                fetch_status = "failed"
+
     text = raw_text if raw_text else fallback
     terms = title_terms(title)
     sentences = split_sentences(text)

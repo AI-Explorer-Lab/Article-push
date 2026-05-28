@@ -116,7 +116,14 @@ python -m src.core.pipeline --date YYYY-MM-DD [--use-llm-writer]
 状态文件不得保存原文全文。
 
 ## 运行问题沉淀规则
+
 失败时写入 `errors/YYYY-MM-DD-log.md`，不自动修改 AGENT.md。
+
+**日志分析 Agent**：
+- 写入错误日志时，`error_logger.py` 先用正则匹配已知坑位（快速路径）
+- 若未命中已知坑位，自动调用 LLM 日志分析 Agent 进行智能分析
+- LLM 分析 Agent 使用独立的 `LOG_ANALYZER_LLM_*` 环境变量（fallback 到 `LLM_*`）
+- AI 分析结果标记 `[AI 分析]` / `[AI 建议]` 前缀，需人工核查后再写入 AGENT.md
 
 ## 已知陷阱
 - 不要收录纯营销或广告内容

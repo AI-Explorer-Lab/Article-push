@@ -2,13 +2,17 @@
 
 新架构（精简后）：
 1. 直接抓取 5 篇候选文章：
-   - 微信公众号（通过搜狗微信搜索）：Challenge Hub、量子位、AI学习的老章
+   - 微信公众号（通过 Selenium 浏览器抓取搜狗微信搜索）：Challenge Hub、量子位、AI学习的老章
    - GitHub Trending/Search（最多 2 篇）
    - 机器之心
    - OpenAI Blog、Google DeepMind Blog
 2. 逐篇用 AI 阅读原文，判断质量（好不好），好的就生成 MD 文章，不好就跳过
 3. 每读完一篇生成完，立即丢弃上下文记忆
 4. 不再先选 10 篇再挑 5 篇，直接边读边判断边生成
+
+微信公众号抓取策略：
+- 优先使用 Selenium + Chrome 无头浏览器（可绕过搜狗反爬）
+- Selenium 不可用时回退到 urllib（但成功率低）
 """
 
 from __future__ import annotations
@@ -179,14 +183,66 @@ def normalize_sogou_link(href: str) -> str:
 # ---------------------------------------------------------------------------
 
 def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog]) -> list[Candidate]:
-    """通过搜狗微信搜索抓取指定公众号的文章。
+    """通过 Selenium 浏览器抓取搜狗微信搜索的文章。
+
+    优先使用 Selenium + Chrome 无头浏览器（绕过反爬），
+    失败时回退到传统 urllib 方式（成功率低）。
+    """
+    candidates: list[Candidate] = []
+
+    # 策略 1: Selenium 浏览器抓取（推荐）
+    try:
+        from src.infrastructure.browser_fetcher import fetch_wechat_source_full
+        articles = fetch_wechat_source_full(
+            account_name=account_name,
+            query=query,
+            max_articles=5,
+            headless=True,
+        )
+        for article in articles:
+            candidates.append(
+                Candidate(
+                    title=article["title"],
+                    source=article["source"],
+                    url=article["url"],
+                    published_at=article.get("published_at", ""),
+                    snippet=article.get("snippet", ""),
+                    body=article.get("body", ""),
+                )
+            )
+            logs.append(
+                FetchLog(
+                    source=account_name,
+                    url=article["url"],
+                    ok=True,
+                    detail=f"Selenium: title={article['title'][:40]}, body={len(article.get('body', ''))} chars",
+                )
+            )
+        if candidates:
+            return candidates
+    except Exception as exc:
+        logs.append(
+            FetchLog(
+                source=account_name,
+                url="Selenium browser",
+                ok=False,
+                detail=f"Selenium failed: {exc}, falling back to urllib",
+            )
+        )
+
+    # 策略 2: 回退到 urllib + 搜索引擎（旧方案，成功率低）
+    return _fetch_sogou_wechat_urllib(account_name, query, logs)
+
+
+def _fetch_sogou_wechat_urllib(account_name: str, query: str, logs: list[FetchLog]) -> list[Candidate]:
+    """旧版 urllib 抓取方案（回退策略）。
 
     搜狗微信搜索已改为 JS 动态加载，纯 HTTP 抓取无法获取完整结果。
     因此改用替代策略：通过搜索引擎搜索 mp.weixin.qq.com 上的文章。
     """
     candidates: list[Candidate] = []
 
-    # 策略 1: 直接搜 mp.weixin.qq.com + 公众号名（通过搜狗通用搜索）
+    # 策略 A: 直接搜 mp.weixin.qq.com + 公众号名（通过搜狗通用搜索）
     search_queries = [
         f"site:mp.weixin.qq.com {account_name} AI",
         f"{account_name} 公众号 mp.weixin.qq.com",
@@ -212,7 +268,6 @@ def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog]) -> l
             )
             continue
 
-        # 从搜狗通用搜索中提取 mp.weixin.qq.com 链接
         wechat_urls = re.findall(
             r'https?://mp\.weixin\.qq\.com/s/[^"&\s]+',
             html_text,
@@ -223,10 +278,8 @@ def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog]) -> l
                 continue
             seen_urls.add(url)
 
-            # 在 URL 附近找标题
             idx = html_text.find(url)
             context_block = html_text[max(0, idx - 500):idx + 200]
-            # 尝试多种标题提取方式
             title = ""
             for pattern in [
                 r'<a[^>]*>\s*<em>(.*?)</em>',
@@ -254,9 +307,9 @@ def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog]) -> l
                     snippet=clean_text(context_block)[:200],
                 )
             )
-            logs.append(FetchLog(source=account_name, url=url, ok=True, detail=f"title={title[:40]}"))
+            logs.append(FetchLog(source=account_name, url=url, ok=True, detail=f"urllib: title={title[:40]}"))
 
-    # 策略 2: 如果上面没结果，尝试直接通过 Bing 搜索
+    # 策略 B: Bing 搜索
     if not candidates:
         try:
             bing_url = f"https://www.bing.com/search?q=site:mp.weixin.qq.com+{quote(account_name)}+AI&count=5"
@@ -509,11 +562,33 @@ def fetch_blog_links(
 
 
 def enrich_candidate(candidate: Candidate) -> None:
-    """抓取候选文章的原文全文。"""
-    if candidate.body:
+    """抓取候选文章的原文全文。
+
+    如果 body 已存在（Selenium 已抓取），则跳过。
+    如果是微信文章 URL，尝试用浏览器抓取（绕过反爬）。
+    其他 URL 使用 urllib 抓取。
+    """
+    if candidate.body and len(candidate.body) >= 300:
         return
+    url = candidate.url
+
+    # 微信文章：尝试用 Selenium 浏览器抓取
+    if "mp.weixin.qq.com" in url:
+        try:
+            from src.infrastructure.browser_fetcher import (
+                create_browser, fetch_wechat_article,
+            )
+            with create_browser(headless=True) as driver:
+                body = fetch_wechat_article(driver, url)
+                if body and len(body) >= 300:
+                    candidate.body = body
+                    return
+        except Exception:
+            pass
+
+    # 回退：urllib 抓取
     try:
-        candidate.body = clean_text(fetch_text(candidate.url, timeout=25))
+        candidate.body = clean_text(fetch_text(url, timeout=25))
     except Exception:
         candidate.body = ""
 
@@ -553,9 +628,9 @@ def collect_candidates(days: int, logs: list[FetchLog]) -> list[Candidate]:
     """
     all_candidates: list[Candidate] = []
 
-    # 1. 微信公众号（通过搜索引擎搜索）
+    # 1. 微信公众号（通过 Selenium 浏览器抓取搜狗微信搜索，失败时回退 urllib）
     for account_name, query in WECHAT_SOURCES:
-        wechat_candidates = fetch_sogou_wechat_legacy(account_name, query, logs)
+        wechat_candidates = fetch_sogou_wechat(account_name, query, logs)
         all_candidates.extend(wechat_candidates)
         time.sleep(1)
 

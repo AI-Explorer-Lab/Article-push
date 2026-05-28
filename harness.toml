@@ -67,6 +67,12 @@ max_original_chars = 120000
 review_max_rounds = 3
 review_pass_score = 75
 
+# 日志分析 Agent 配置（独立于写作/审稿 Agent，使用 LOG_ANALYZER_LLM_* 环境变量）
+# 当已知坑位规则未匹配时，自动调用 LLM 分析失败日志并给出沉淀建议
+# 若未配置 LOG_ANALYZER_LLM_*，则 fallback 到 LLM_*；都不可用则不启用 LLM 分析
+log_analyzer_enabled = true
+log_analyzer_max_input_chars = 8000
+
 # AI 质量评估配置
 quality_evaluation = true
 quality_eval_temperature = 0.2
