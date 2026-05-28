@@ -18,34 +18,16 @@ from src.core.context import extract_required_terms
 STYLE_CONTRACTS = {
     "主线型": {
         "position": "围绕一条具体事件推进，先讲清楚原文发生了什么，再解释为什么重要。",
-        "sections": [
-            "主体动作要先钉住",
-            "变化发生在执行链路",
-            "影响会落到具体角色",
-            "后续只看可验证进展",
-        ],
         "must_answer": ["发生了什么", "谁做了什么", "为什么值得单独写", "后续应该看什么"],
         "tone": "事实密度优先，判断跟在事实后面，不写空泛趋势口号。",
     },
     "解读型": {
         "position": "围绕一个趋势或技术信号展开，原文事实是证据，文章重点是解释变化背后的原因。",
-        "sections": [
-            "先限定这次信号的边界",
-            "技术变化落在接入方式",
-            "开发者会在流程里感到差异",
-            "判断成本比判断热度更重要",
-        ],
         "must_answer": ["趋势是什么", "原文事实如何支撑趋势", "技术含义是什么", "对行业或开发者有什么影响"],
         "tone": "解释要克制，避免把单条新闻拔高成确定趋势。",
     },
     "工具型": {
         "position": "围绕工具、项目或产品展开，先说明它是什么，再说明适合谁、边界在哪里。",
-        "sections": [
-            "先确认它解决的问题",
-            "适用场景来自任务约束",
-            "工程价值取决于生命周期",
-            "边界要放到失败场景里看",
-        ],
         "must_answer": ["它是什么", "适合谁", "技术看点是什么", "局限和验证点是什么"],
         "tone": "少写宣传词，多写使用场景、失败路径和工程约束。",
     },
@@ -67,18 +49,16 @@ def infer_article_type(item: dict) -> str:
 
 
 def article_title(item: dict, article_type: str) -> str:
-    """根据条目和类型生成文章标题。"""
+    """根据条目和类型生成文章标题。
+
+    只做基础清理，不再拼接固定后缀模板。
+    最终标题由 LLM 在写作时根据原文内容自由生成。
+    """
     title = str(item.get("title", "")).strip(" .")
-    url = str(item.get("url", ""))
-    if article_type == "工具型" and "github.com/" in url:
-        repo = url.rstrip("/").split("github.com/")[-1]
-        name = repo.split("/")[-1] if "/" in repo else repo
-        return f"{name} 能不能进入工作流，要看状态和失败处理"
+    # 清理 GitHub 前缀和多余标点
     compact = re.sub(r"GitHub 项目更新：", "", title)
     compact = compact.replace("！", "").replace("？", "")
-    if article_type == "解读型":
-        return f"{compact[:22]}，关键在接入方式怎么变"
-    return f"{compact[:24]}，先看它改动了哪段流程"
+    return compact[:50]
 
 
 def source_subject(item: dict) -> str:

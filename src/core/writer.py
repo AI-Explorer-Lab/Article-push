@@ -92,52 +92,59 @@ def build_llm_writer_prompt(item: dict, original_text: str) -> list[dict]:
 
     github_note = ""
     if article_type == "工具型" and "github.com/" in str(item.get("url", "")).lower():
-        github_note = f"- 这是 GitHub/开源项目文章，标题后 8 行内必须保留项目链接：{item.get('url')}\n"
+        github_note = f"- 标题下方保留项目链接：{item.get('url')}\n"
 
-    type_checklist = {
+    # 每种类型的风格引导（不用 checklist 强制要求出现特定关键词）
+    type_guidance = {
         "主线型": (
-            "- 主线型必须自然覆盖：事实切入、为什么重要、影响或改变、后续观察。\n"
-            "- 正文里要出现\"这次事件\"或\"这次进展\"，并明确写出\"影响\"与\"接下来/后续\"。\n"
+            "这是主线型文章：围绕一条具体事件推进。\n"
+            "先讲清楚原文发生了什么（谁、做了什么、结果是什么），"
+            "再解释这件事改变了什么，最后落到后续应该观察什么。\n"
+            "不要写成「先说概念再讲意义」的模板结构；"
+            "让事实本身驱动叙述节奏，判断放在事实之后。\n"
         ),
         "解读型": (
-            "- 解读型必须自然覆盖：信号边界、机制解释、技术含义、影响判断。\n"
-            "- 正文里要出现\"信号/边界/观察\"之一，\"接入方式/机制/流程/成本结构\"之一。\n"
+            "这是解读型文章：围绕一个技术信号或趋势展开。\n"
+            "先用原文中的具体事实说明信号是什么、边界在哪里，"
+            "再解释这个变化背后的机制原因，最后判断对开发者或行业意味着什么。\n"
+            "不要拔高成确定趋势，判断要克制，留有余地。\n"
         ),
         "工具型": (
-            "- 工具型必须自然覆盖：工具定义、适合人群、技术看点、局限提醒。\n"
-            "- 正文里要出现\"技术看点\"，也要出现\"局限/风险/需要验证/谨慎\"之一。\n"
+            "这是工具型文章：围绕一个工具、项目或产品展开。\n"
+            "先说清楚它解决什么问题、怎么用的，"
+            "再说它的技术设计和工程取舍有什么值得注意的，"
+            "最后诚实地说它的局限和需要验证的地方。\n"
+            "不写宣传腔，多写使用场景和失败路径。\n"
         ),
     }.get(article_type, "")
 
     system = (
-        "你是严谨的技术公众号编辑。你只能基于用户提供的原文全文写作，"
-        "不得联网，不得添加原文没有的事实，不得把标题、关键词或摘要当作事实来源。"
+        "你是一名技术公众号编辑，文章风格贴近「技术博客 + 行业观察」。\n"
+        "你只能基于用户提供的原文全文写作，不得联网，不得添加原文没有的事实。\n"
+        "写作要求：\n"
+        "- 有自己的判断和视角，不是原文的摘要或翻译。\n"
+        "- 段落有起承转合：一段话里的事实、解释、判断要自然衔接，不要各说各的。\n"
+        "- 二级标题要像人写的：用原文中的具体信息做标题，不要写成「XX的意义」「XX的影响」这种泛泛的概括句。\n"
+        "- 不要用「首先…其次…最后」「一方面…另一方面」「总而言之」这种套话连接词。\n"
+        "- 不要出现「在当今时代」「随着AI的发展」「众所周知」这类空洞开头。\n"
     )
 
-    user = f"""请基于下面的"原文全文"写一篇原创中文 Markdown 文章。
+    user = f"""请基于下面的原文全文，写一篇原创中文 Markdown 文章。
 
+{type_guidance}
 硬性规则：
-- 只能使用原文全文中的事实；允许重组、解释、压缩和改写，但不允许新增事实。
-- 如果原文信息不足，必须降低判断强度，不要补细节。
-- 当前文章写完后，原文上下文会被丢弃；不要引用上一篇或其他文章的信息。
-- Markdown 必须以一个一级标题开头，且只能有一个一级标题。
-- 至少 3 个二级标题，二级标题必须写成具体判断。
-- 中文正文 1300-1800 字，不能短于 1200 字。
-- 段落以 2-4 句话为主，避免大量单句短段落。
-- 至少写一个具体例子或类比，使用"比如"或"举个例子"自然展开。
-- 不写"参考来源""来源""据某媒体报道"等归因区块。
-- 不写"真正值得看""背后的技术信号""这条动态值得拆开看""不只要看功能"等模板腔。
+- 只能使用原文中的事实；允许重组、解释、压缩和改写，但不允许新增事实。
+- 如果原文信息不足，必须降低判断强度，不要脑补细节。
+- Markdown 以一级标题开头（只能有一个一级标题），一级标题要像一篇独立文章的标题，而不是「关于XX的几点思考」这种。
+- 至少 3 个二级标题，每个二级标题要包含原文中的具体信息（人名、项目名、数据、技术术语等），不要写成空泛的概括句。
+- 中文正文 1300-1800 字。
+- 段落 2-4 句为主，单句不独立成段。
+- 至少嵌入一个自然的具体例子或类比。
+- 不写归因区块（「参考来源」「据XX报道」等）。
+- 不写「真正值得看」「背后的技术信号」「这条动态值得拆开看」等模板腔。
 {github_note}
-{type_checklist}
-文章类型：{article_type}
-类型写法：{contract.get("position", "")}
-必须回答：{"；".join(contract.get("must_answer", []))}
-标题建议：{plan.get("title", "")}
-核心判断：{plan.get("core_claim", "")}
-必须自然覆盖的关键对象：{"；".join(map(str, must_include))}
-
-原文标题：{item.get("title", "")}
-原文 URL：{item.get("url", "")}
+核心判断（仅供参考，不要照抄）：{plan.get("core_claim", "")}
+原标题（仅供参考）：{item.get("title", "")}
 
 原文全文：
 {original_text[:120000]}
@@ -146,7 +153,11 @@ def build_llm_writer_prompt(item: dict, original_text: str) -> list[dict]:
 
 
 def polish_llm_article(content: str, article_type: str) -> str:
-    """对 LLM 生成的文章进行风格润色。"""
+    """对 LLM 生成的文章进行风格润色。
+
+    只做去模板腔的文本替换，不再强制改写二级标题。
+    标题的最终形态由 LLM 根据原文内容自由生成。
+    """
     replacements = {
         "真正值得看的不是": "需要关注的不是",
         "真正值得看的，不是": "需要关注的，不是",
@@ -161,6 +172,16 @@ def polish_llm_article(content: str, article_type: str) -> str:
         "放回日常工作里": "放到具体团队流程里",
         "上下文来源：": "上下文入口：",
         "三类上下文来源：": "三类上下文入口：",
+        "在当今时代，": "",
+        "随着AI的快速发展，": "",
+        "众所周知，": "",
+        "值得注意的是，": "",
+        "值得一提的是，": "",
+        "首先，": "",
+        "其次，": "",
+        "最后，": "",
+        "综上所述，": "",
+        "总而言之，": "",
     }
     for old, new in replacements.items():
         content = content.replace(old, new)
@@ -169,38 +190,7 @@ def polish_llm_article(content: str, article_type: str) -> str:
         r"关键\1不在于\2，而在于",
         content,
     )
-
-    heading_replacements = {
-        "主线型": {
-            "为什么重要": "影响开始落到分发和决策链路",
-            "接下来怎么看": "后续要看闭环是否跑通",
-            "后续观察": "后续要看闭环是否跑通",
-        },
-        "解读型": {
-            "背后原因": "机制变化落在接入方式",
-            "技术含义": "工程含义落在上下文和接口",
-            "接下来": "落地还要看成本和复盘",
-        },
-        "工具型": {
-            "它是什么": "定位先从任务入口说清楚",
-            "适合谁": "适用人群取决于任务约束",
-            "技术看点": "快照、状态和门禁决定可用性",
-            "局限": "边界要放到失败场景里验证",
-            "需要验证": "边界要放到失败场景里验证",
-        },
-    }
-    mapping = heading_replacements.get(article_type, {})
-    lines = []
-    for line in content.splitlines():
-        if line.startswith("## "):
-            heading = line[3:].strip()
-            for marker, replacement in mapping.items():
-                if heading.startswith(marker):
-                    heading = replacement
-                    break
-            line = f"## {heading}"
-        lines.append(line)
-    return wrap_long_paragraphs("\n".join(lines))
+    return wrap_long_paragraphs(content)
 
 
 def wrap_long_paragraphs(article: str) -> str:
@@ -318,7 +308,7 @@ def rewrite_one_article_rules(
     if article_type == "工具型" and "github.com/" in str(item.get("url", "")).lower():
         project_line = f"\n项目链接：{item['url']}\n"
 
-    sections = contract["sections"]
+    sections = contract.get("sections", contract.get("must_answer", ["事实", "判断", "影响", "后续"]))
     intro = build_intro(article_type, subject, claim, facts)
 
     body = [
@@ -328,23 +318,14 @@ def rewrite_one_article_rules(
         "",
         required_terms,
         "",
-        f"## {sections[0]}",
-        "",
-        _build_section(article_type, facts, claim, 0, contract),
-        "",
-        f"## {sections[1]}",
-        "",
-        _build_section(article_type, facts, claim, 1, contract),
-        "",
-        f"## {sections[2]}",
-        "",
-        _build_section(article_type, facts, claim, 2, contract),
-        "",
-        f"## {sections[3]}",
-        "",
-        _build_section(article_type, facts, claim, 3, contract),
-        "",
     ]
+    for i, section in enumerate(sections[:4]):
+        body.extend([
+            f"## {section}",
+            "",
+            _build_section(article_type, facts, claim, i, contract),
+            "",
+        ])
     article = "\n".join(body)
     article = _expand_if_short(article, article_type, subject, claim)
     article = wrap_long_paragraphs(article)

@@ -1,4 +1,11 @@
-"""src/validators/verify_article.py - daily_paper Markdown 成稿验证与编辑评分脚本"""
+"""src/validators/verify_article.py - daily_paper Markdown 成稿验证脚本。
+
+审稿逻辑：
+- 硬性规则（文件名、字数、禁止词、GitHub 链接等）：继续用规则检查
+- 内容质量评估（结构、观点、可读性、模板腔等）：交给独立审稿 Agent 判断
+- 审稿 Agent 使用独立的 LLM provider（REVIEW_LLM_* 环境变量），
+  与写作 LLM 隔离，避免「自己写的自己打高分」的 bias
+"""
 
 from __future__ import annotations
 
@@ -21,25 +28,6 @@ PROHIBITED_PATTERNS = [
     ("量子位", r"量子位"),
     ("机器之心", r"机器之心"),
     ("公众号名", r"Challenge Hub|AI学习的老章"),
-]
-
-GENERIC_HEADING_PATTERNS = [
-    r"^发生了什么",
-    r"^这次发生了什么",
-    r"^为什么重要",
-    r"^为什么这件事值得",
-    r"^为什么值得",
-    r"^背后原因",
-    r"^技术含义",
-    r"^技术看点",
-    r"^适合谁",
-    r"^局限",
-    r"^需要谨慎",
-    r"^接下来",
-    r"^后续观察",
-    r"^它是什么",
-    r"^它解决",
-    r"^真实痛点",
 ]
 
 OVERUSED_TEMPLATE_PATTERNS = [
@@ -85,13 +73,12 @@ def load_deepread(path: Path | None) -> dict[str, dict]:
 
 
 def infer_article_type(text: str) -> str | None:
-    if "它是什么" in text or "适合谁" in text or "技术看点" in text:
+    """从文章内容推断类型。"""
+    if "github.com/" in text.lower() or "仓库" in text or "项目链接" in text:
         return "工具型"
-    if "为什么" in text and ("趋势" in text or "背后" in text):
+    if "趋势" in text or "信号" in text:
         return "解读型"
-    if "发生了什么" in text or "这次发生了什么" in text:
-        return "主线型"
-    return None
+    return "主线型"
 
 
 def has_any(text: str, keywords: list[str]) -> bool:
@@ -110,6 +97,11 @@ def covered_terms(text: str, terms: list[str]) -> list[str]:
 
 
 def verify_structure_by_type(text: str, article_type: str) -> tuple[list[str], list[str]]:
+    """检查文章是否覆盖了对应类型的关键内容维度。
+
+    注意：不再强制要求出现特定关键词，改为检查是否有相关内容信号。
+    不通过的项作为 warnings 而非 errors，不会阻断 pipeline。
+    """
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -140,7 +132,7 @@ def verify_structure_by_type(text: str, article_type: str) -> tuple[list[str], l
 
     for label, keywords in groups.items():
         if not has_any(text, keywords):
-            errors.append(f"{article_type} 缺少结构要素: {label}")
+            warnings.append(f"{article_type} 可能缺少内容维度: {label}（非阻断）")
 
     return errors, warnings
 
