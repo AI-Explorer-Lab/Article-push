@@ -1,13 +1,17 @@
-"""src/core/pipeline.py - 精简版 Harness 流水线编排。
+"""src/core/pipeline.py - Harness 流水线编排。
 
-新架构（精简后）：
+架构：
 1. agent.py 直接抓取 5 篇候选（GitHub 最多 2，其他至少 3）
 2. deepread 确认选题并生成计划
-3. writer 逐篇 AI 评估质量 + 生成 MD（好的写，不好的跳过）
-4. 验证产出
-5. 每篇读完生成完，立即丢弃上下文
+3. writer 逐篇 AI 评估质量 + 生成 MD 初稿（好的写，不好的跳过）
+4. 审稿 Agent 独立评审 → 不通过则带着审稿建议让 writer 修改 → 再审
+5. 审稿全部通过后丢弃上下文记忆
+6. 验证产出
 
-不再先选 10 篇再挑 5 篇。
+核心创新：
+- 写作 LLM 和审稿 Agent 使用不同的 LLM 实例（独立 API Key/Model）
+- 审稿不通过时，文章上下文保留，writer 根据审稿建议重新修改
+- 避免了「自己写自己打分」的 bias
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from src.common.utils import load_json, write_json
+from src.common.utils import chinese_char_count, load_json, write_json
 from src.core.deepread import build_deepread
 from src.infrastructure.error_logger import StageResult, write_error_log
 from src.core.writer import generate_articles
@@ -235,8 +239,10 @@ def main() -> None:
         print(f"\n[LLM] LLM 模式启用: {llm_provider.model}")
         print("   每篇文章会先用 AI 评估原文质量，好的生成 MD，不好的跳过")
 
+    contexts: dict[str, dict] = {}
+    article_states: list[dict] = []
     try:
-        generate_articles(
+        article_states, contexts = generate_articles(
             deepread_path=deepread_path,
             root=ROOT,
             overwrite=args.overwrite_articles,
@@ -270,7 +276,126 @@ def main() -> None:
         write_error_log(args.date, results, ERRORS_DIR)
         raise SystemExit(results[-1].returncode)
 
-    # Stage 6: 逐篇验证文章
+    # Stage 5.5: 审稿修订循环（对每篇文章：审稿 → 不通过则修改 → 再审）
+    from src.validators.verify_article import _create_reviewer_provider, verify_article
+    from src.core.writer import revise_article_with_review_feedback, discard_contexts, save_article_states
+
+    deepread_data = load_json(deepread_path)
+    deepread_items = {Path(item.get("output_file", "")).name: item for item in deepread_data.get("selected_items", [])}
+
+    reviewer = _create_reviewer_provider()
+    if reviewer:
+        print(f"\n[审稿 Agent] 已启用: {reviewer.model}")
+        print(f"[审稿 Agent] 与写作 LLM 使用不同的 provider 实例，避免自己写自己打分的 bias")
+    else:
+        print("\n[审稿 Agent] 未配置（REVIEW_LLM_API_KEY），跳过审稿修订循环")
+
+    MAX_REVISE_ROUNDS = args.llm_rewrite_attempts if args.llm_rewrite_attempts > 0 else 3
+
+    if reviewer and llm_provider:
+        print(f"\n{'='*60}")
+        print(f"审稿修订循环（最多 {MAX_REVISE_ROUNDS} 轮）")
+        print(f"{'='*60}")
+
+        for state in article_states:
+            if state.get("stage") not in ("drafted", "revised"):
+                continue
+
+            output_filename = state.get("output_file", "")
+            output_path = ROOT / output_filename
+            if not output_path.exists():
+                continue
+
+            deepread_item = deepread_items.get(Path(output_filename).name)
+            context = contexts.get(Path(output_filename).name)
+
+            for round_num in range(1, MAX_REVISE_ROUNDS + 1):
+                print(f"\n  [{output_filename}] 第 {round_num} 轮审稿...")
+                result = verify_article(output_path, deepread_item, reviewer=reviewer)
+
+                if result["passed"]:
+                    print(f"  [{output_filename}] ✅ 审稿通过 (评分: {result['score']})")
+                    state["stage"] = "review_passed"
+                    state["review_rounds"] = round_num
+                    state["review_score"] = result["score"]
+                    state["verification"] = {
+                        "stage": "review_passed",
+                        "passed": True,
+                        "score": result["score"],
+                    }
+                    break
+
+                print(f"  [{output_filename}] ❌ 审稿未通过 (评分: {result['score']}, 门槛: 75)")
+                suggestions = result.get("rewrite_suggestions", [])
+                checks = result.get("checks", {})
+                for s in suggestions:
+                    print(f"    💬 {s}")
+
+                if round_num >= MAX_REVISE_ROUNDS:
+                    print(f"  [{output_filename}] ⚠️ 已达最大修订轮数 ({MAX_REVISE_ROUNDS})，标记为审稿失败")
+                    state["stage"] = "review_failed"
+                    state["review_rounds"] = round_num
+                    state["review_score"] = result["score"]
+                    state["verification"] = {
+                        "stage": "review_failed",
+                        "passed": False,
+                        "score": result["score"],
+                    }
+                    break
+
+                # 用审稿建议 + 原文上下文让写作 LLM 修改
+                if not context or not context.get("original_text"):
+                    print(f"  [{output_filename}] ⚠️ 无上下文可用，无法修改")
+                    state["stage"] = "review_failed_no_context"
+                    break
+
+                print(f"  [{output_filename}] 🔄 根据审稿建议修改中...")
+                original_text = str(context.get("original_text", ""))
+                current_text = output_path.read_text(encoding="utf-8")
+                try:
+                    revised = revise_article_with_review_feedback(
+                        article_text=current_text,
+                        original_text=original_text,
+                        item=deepread_item or {},
+                        review_suggestions=suggestions,
+                        review_checks=checks,
+                        llm_provider=llm_provider,
+                    )
+                    output_path.write_text(revised, encoding="utf-8")
+                    state["stage"] = "revised"
+                    state["revision_round"] = round_num
+                    print(f"  [{output_filename}] 📝 修改完成 ({chinese_char_count(revised)} 字)")
+                except Exception as exc:
+                    print(f"  [{output_filename}] ❌ 修改失败: {exc}")
+                    state["stage"] = "revision_error"
+                    state["revision_error"] = str(exc)
+                    break
+
+        # 审稿完成后丢弃所有上下文
+        discard_contexts(contexts)
+
+        # 写入最终状态文件
+        github_count = sum(1 for s in article_states if "github.com/" in str(s.get("url", "")).lower() and s.get("stage") not in ("skipped_github_limit", "skipped_quality", "failed_fetch", "failed_generate"))
+        generated_count = sum(1 for s in article_states if s.get("stage") in ("kept_existing", "drafted", "revised", "review_passed", "review_failed"))
+        save_article_states(deepread_path, ROOT, article_states, generated_count, github_count)
+
+        # 统计审稿结果
+        passed = sum(1 for s in article_states if s.get("stage") == "review_passed")
+        failed = sum(1 for s in article_states if s.get("stage") in ("review_failed", "review_failed_no_context"))
+        print(f"\n[审稿总结] 通过: {passed}, 未通过: {failed}, 其他: {len(article_states) - passed - failed}")
+
+        if failed > 0:
+            print("[审稿] 有文章未通过审稿，pipeline 将标记为失败")
+            # 不直接 exit，让后续验证阶段报告详细错误
+    else:
+        # 没有审稿 Agent 或没有写作 LLM，直接丢弃上下文
+        from src.core.writer import discard_contexts, save_article_states
+        discard_contexts(contexts)
+        github_count = sum(1 for s in article_states if "github.com/" in str(s.get("url", "")).lower() and s.get("stage") not in ("skipped_github_limit", "skipped_quality", "failed_fetch", "failed_generate"))
+        generated_count = sum(1 for s in article_states if s.get("stage") in ("kept_existing", "drafted"))
+        save_article_states(deepread_path, ROOT, article_states, generated_count, github_count)
+
+    # Stage 6: 逐篇验证文章（最终门禁）
     article_results = verify_selected_articles(deepread_path)
     update_article_states(deepread_path, article_results)
     results.extend(article_results)
