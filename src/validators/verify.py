@@ -1,5 +1,7 @@
 """src/validators/verify.py - 技术日报的 Harness 验证脚本"""
 
+from __future__ import annotations
+
 import json
 import sys
 from datetime import datetime, timedelta

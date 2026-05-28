@@ -1,10 +1,12 @@
-"""src/validators/verify_consistency.py - 自动化规则一致性校验脚本。
+"""src/validators/verify_consistency.py - 自动化规则一致性校验脚本（精简版）。
 
 检查以下一致性：
 1. AGENT.md 中声明的关注领域 vs agent.py 中的 FOCUS_TOPICS
 2. AGENT.md 中声明的关注领域 vs verify.py 中的 valid_categories
 3. harness.toml 中的配置 vs 代码中的硬编码常量
 4. 确保规则契约与代码实现之间没有漂移
+
+v2.0 变更：不再检查 Anthropic News 等已移除的信息源。
 """
 
 from __future__ import annotations

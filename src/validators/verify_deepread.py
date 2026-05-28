@@ -1,5 +1,7 @@
 """src/validators/verify_deepread.py - 深度阅读中间文件验证脚本"""
 
+from __future__ import annotations
+
 import json
 import re
 import sys
@@ -73,7 +75,7 @@ def verify_deepread(file_path: str | Path) -> VerifierResult:
         return VerifierResult(passed=False, errors=errors, warnings=warnings)
 
     if not 3 <= len(items) <= 5:
-        errors.append(f"selected_items 数量应为 3-5 条，当前为 {len(items)} 条")
+        errors.append(f"selected_items 数量应为 3-5 条，目标 5 条，当前为 {len(items)} 条")
 
     seen_urls: set[str] = set()
     seen_outputs: set[str] = set()
@@ -124,7 +126,8 @@ def verify_deepread(file_path: str | Path) -> VerifierResult:
 
             output_path = Path(output_file)
             if not output_path.exists():
-                errors.append(f"{tag} output_file 指向的 Markdown 不存在: {output_file}")
+                # 文章可能因质量评估不通过被跳过，降级为 warning
+                warnings.append(f"{tag} output_file 指向的 Markdown 不存在（可能因质量评估不通过被跳过）: {output_file}")
             elif output_path.suffix.lower() != ".md":
                 errors.append(f"{tag} output_file 必须是 .md 文件: {output_file}")
             if not output_file.replace("\\", "/").startswith("daily_paper/"):

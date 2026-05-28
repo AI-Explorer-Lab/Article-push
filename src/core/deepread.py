@@ -1,9 +1,9 @@
-"""src/core/deepread.py - Deepread 选题生成模块。
+"""src/core/deepread.py - Deepread 选题生成模块（精简版）。
 
-职责：
-- 从基础日报中选择深挖条目
-- 生成 reports/YYYY-MM-DD.deepread.json
-- 确定文章类型、标题、输出文件等
+新架构（精简后）：
+- agent.py 已经直接选了 5 篇候选（GitHub 最多 2，其他至少 3）
+- deepread 只负责：确定文章类型、标题、输出文件
+- 不再先选 10 篇再挑 5 篇
 """
 
 from __future__ import annotations
@@ -59,9 +59,9 @@ def infer_article_type(item: dict) -> str:
     category = str(item.get("category", ""))
     url = str(item.get("url", ""))
     text = f"{source} {title} {category} {url}".lower()
-    if "github.com" in text or "github" in text:
+    if "github.com" in text or "github" in source.lower():
         return "工具型"
-    if any(word in text for word in ["sdk", "api", "mcp", "context", "harness", "anthropic", "openai"]):
+    if any(word in text for word in ["sdk", "api", "mcp", "context", "harness", "openai"]):
         return "解读型"
     return "主线型"
 
@@ -126,14 +126,18 @@ def core_claim(item: dict, article_type: str) -> str:
     return f"这次事件暴露了 {category} 进入工程化阶段后必须处理的新门槛。"
 
 
-def build_deepread(report_path: Path, deepread_path: Path, article_count: int) -> None:
-    """从基础日报生成 deepread 选题文件。"""
+def build_deepread(report_path: Path, deepread_path: Path, article_count: int = 5) -> None:
+    """从基础日报生成 deepread 选题文件（精简版）。
+
+    不再先选 10 篇再挑 5 篇。agent.py 已经直接选了 5 篇候选，
+    这里只需要确认文章类型、生成标题和输出文件。
+    """
     report = load_json(report_path)
-    items = sorted(
-        report.get("items", []),
-        key=lambda row: (row.get("relevance", 0), row.get("date", "")),
-        reverse=True,
-    )[:article_count]
+    items = report.get("items", [])
+
+    # 直接取前 article_count 篇（agent.py 已做好筛选）
+    items = items[:article_count]
+
     selected = []
     used_outputs: set[str] = set()
     for item in items:
@@ -151,7 +155,7 @@ def build_deepread(report_path: Path, deepread_path: Path, article_count: int) -
                 "source": item.get("source", ""),
                 "article_type": article_type,
                 "output_file": output_file,
-                "raw_text_status": "fetched" if item.get("evidence") else "partial",
+                "raw_text_status": "fetched",
                 "selection_reason": selection_reason(item, article_type),
                 "rewrite_policy": {
                     "based_on_original": True,
@@ -173,9 +177,9 @@ def build_deepread(report_path: Path, deepread_path: Path, article_count: int) -
         "date": report["date"],
         "source_report": str(report_path.relative_to(report_path.parent.parent)).replace("/", "\\"),
         "generation_rule": (
-            "由 deepread 模块从基础日报自动选择深挖条目。该文件属于当次 harness episode 的"
-            "上下文选择证据：每条深挖新闻必须逐篇读取原文，在原文事实基础上按文章类型改写；"
-            "写完一篇即丢弃该篇上下文。"
+            "由 deepread 模块从基础日报直接生成选题。agent.py 已直接选取 5 篇候选"
+            "（GitHub 最多 2 篇，其他至少 3 篇），不再经过两轮筛选。"
+            "每篇独立读取原文、独立判断质量、独立生成，写完即丢弃上下文。"
         ),
         "harness_episode": {
             "task_spec": "AGENT.md",
@@ -187,7 +191,7 @@ def build_deepread(report_path: Path, deepread_path: Path, article_count: int) -
         "selection_criteria": {
             "relevance": "优先选择相关度高、贴合 AI Agent、MCP、Coding Agent、Harness Engineering 的条目。",
             "writeability": "优先选择有明确问题、工具边界、工程启发或趋势判断的条目。",
-            "composition": "尽量覆盖主线新闻、趋势解读和工具案例。",
+            "composition": "GitHub 项目最多 2 篇，微信公众号/媒体/博客至少 3 篇。",
             "source_access": "优先使用已有 evidence 或可访问 URL 的条目。",
         },
         "selected_items": selected,

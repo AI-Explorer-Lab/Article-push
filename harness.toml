@@ -1,19 +1,19 @@
-# harness.toml - Harness 流水线结构化配置文件
+# harness.toml - Harness 流水线结构化配置文件（精简版）
 # 该文件与 AGENT.md 互补：AGENT.md 是规则契约，harness.toml 是机器可解析的配置参数。
-# 代码应从此文件读取参数，而非硬编码在模块中。
 
 [project]
 name = "微信公众号推送-harness"
-description = "微信公众号 AI 技术内容生产 Harness 流水线"
-version = "1.0.0"
+description = "微信公众号 AI 技术内容生产 Harness 流水线（精简版）"
+version = "2.0.0"
 
 [pipeline]
-# 默认流水线参数
+# 精简版流水线参数
+# agent.py 直接抓取 5 篇候选（GitHub 最多 2，其他至少 3）
+# writer 逐篇 AI 评估质量 + 生成 MD
 default_days = 10
-default_limit = 10
-default_article_count = 5
-min_article_count = 3
-max_article_count = 5
+target_article_count = 5
+max_github = 2
+min_non_github = 3
 
 # 输出目录
 reports_dir = "reports"
@@ -34,14 +34,12 @@ topics = [
     "Vibe Coding",
 ]
 
-# 每个领域涵盖的关键主题/公司（用于抓取关键词匹配，非独立领域）
 [focus_topics.aliases]
 "AI Agent" = ["Agentic AI", "Multi-Agent", "智能体"]
 "AI Coding" = ["Codex", "Claude Code", "GitHub Copilot", "Copilot"]
 "MCP" = ["Model Context Protocol"]
 
 [valid_categories]
-# 有效分类列表（需与 verify.py 保持一致）
 categories = [
     "AI Agent",
     "Harness Engineering",
@@ -54,21 +52,20 @@ categories = [
     "其他",
 ]
 
-[dedupe]
-# 去重策略配置
-source_cap = 3           # 单来源最多收录条数
-min_relevance = 3        # 最低相关度阈值
-two_round_strategy = true # 两轮去重：先限来源再放宽
-
 [llm]
 # LLM 写作器默认配置
-default_model = ""       # 留空则从 LLM_MODEL 环境变量读取
+default_model = ""
 default_temperature = 0.45
 default_max_tokens = 4096
 max_retries = 3
 request_timeout = 240
-revision_max_attempts = 1
+revision_max_attempts = 0
 max_original_chars = 120000
+
+# AI 质量评估配置
+quality_evaluation = true
+quality_eval_temperature = 0.2
+quality_eval_max_tokens = 200
 
 [article]
 # 文章生成约束
@@ -79,3 +76,9 @@ min_score_for_publish = 75
 max_paragraph_chars = 170
 min_sentence_chars = 24
 max_sentence_chars = 180
+
+[fetch]
+# 抓取配置
+wechat_sogou_delay = 1.0   # 搜狗微信搜索请求间隔（秒）
+article_fetch_delay = 0.5  # 文章原文抓取间隔（秒）
+fetch_timeout = 20         # 抓取超时（秒）
