@@ -1,15 +1,29 @@
-# 微信公众号推送-harness（精简版 v2.0）
+# 微信公众号推送-harness（v2.1 — 审稿修订版）
 
 微信公众号 AI 技术内容生产 Harness 流水线 —— 从信息抓取到成稿校验的全流程自动化工具。
 
-## 精简版变更
+## 核心创新：双 Agent 架构
+
+- **写作 Agent**（`LLM_API_KEY`）：负责阅读原文、生成初稿、根据审稿意见修改
+- **审稿 Agent**（`REVIEW_LLM_API_KEY`）：独立的 LLM 实例，负责五维度审稿评分
+- **为什么要两个 Agent？** 自己写自己打分容易 bias 高分；独立审稿 Agent 给出客观评价
+- **审稿不通过怎么办？** 审稿建议喂回写作 Agent，修改后重新审稿，最多 N 轮，直到通过或达到上限
+
+## v2.1 变更
+
+相比 v2.0：
+- **独立审稿 Agent**：用另一个 LLM（`REVIEW_LLM_*` 环境变量）做五维度审稿，避免「自己写自己打分」
+- **审稿修订循环**：审稿不通过时，保留上下文记忆，写作 Agent 根据审稿建议修改后重新提交审稿
+- **记忆生命周期**：原文上下文不再一写即丢，而是保留到审稿通过后才丢弃
+- 审稿维度：hook（开头吸引力）、point_of_view（观点判断力）、storyline（结构推进感）、technical_depth（技术深度）、wechat_readability（公众号可读性）
+
+## 精简版变更（v2.0）
 
 相比 v1.0：
 - **移除 Anthropic News 抓取**（经常返回垃圾数据）
 - **修复微信公众号搜狗搜索**（更稳定的解析逻辑）
 - **简化流程**：不再先选 10 篇再挑 5 篇，agent.py 直接抓取并筛选 5 篇
 - **增加 AI 质量评估**：获取原文后用 AI 判断好不好，好的生成 MD，不好跳过
-- **逐篇处理**：每读完一篇生成完，立即丢弃上下文记忆
 - **GitHub 最多 2 篇**，微信公众号/媒体/博客至少 3 篇
 
 ## 项目结构
@@ -28,8 +42,8 @@ src/
 │   ├── agent.py                    # 直接抓取 5 篇候选（GitHub≤2，其他≥3）
 │   ├── context.py                  # 原文抓取与事实提取
 │   ├── deepread.py                 # 选题计划生成
-│   ├── writer.py                   # AI 质量评估 + 文章写作
-│   └── pipeline.py                 # 流程编排
+│   ├── writer.py                   # AI 质量评估 + 文章写作 + 审稿修订
+│   └── pipeline.py                 # 流程编排（含审稿修订循环）
 │
 └── validators/                     # 验证层
     ├── verify.py                   # 日报 JSON 校验
@@ -56,9 +70,16 @@ states/                  # 运行状态
 创建 `.env` 文件（使用 LLM 评估和改写功能时需要）：
 
 ```bash
+# 写作 Agent（生成文章和根据审稿意见修改）
 LLM_API_KEY=your_api_key
 LLM_API_BASE=https://api.openai.com/v1
 LLM_MODEL=gpt-4o
+
+# 审稿 Agent（可选，独立审稿评分，避免自己写自己打分）
+# 如果不配置，会 fallback 到写作 LLM（至少是不同的调用实例）
+REVIEW_LLM_API_KEY=your_review_api_key     # 可选：独立审稿 API Key
+REVIEW_LLM_MODEL=gpt-4o                    # 可选：独立审稿模型
+REVIEW_LLM_API_BASE=https://api.openai.com/v1  # 可选：独立审稿 API Base
 ```
 
 ### 一键运行全流水线
@@ -113,16 +134,21 @@ python src/validators/verify_deepread.py
 python src/validators/verify_article.py daily_paper/2026-05-28-01.md
 ```
 
-## 流水线工作流（精简版）
+## 流水线工作流
 
 ```
 agent.py → reports/YYYY-MM-DD.json          （直接抓取 5 篇候选）
      ↓
 deepread → deepread.json                     （确认选题计划）
      ↓
-writer → AI 评估质量 + 逐篇生成 MD           （好的写，不好跳过）
+writer → AI 评估质量 + 逐篇生成 MD 初稿      （好的写，不好跳过）
      ↓
-verify*.py → 质量校验                        （自动验证）
+审稿 Agent → 五维度审稿评分                  （独立 LLM，避免 bias）
+     ↓
+  ├─ PASS → 丢弃上下文，进入验证
+  └─ FAIL → 写作 Agent 根据审稿建议修改 → 再审（最多 N 轮）
+     ↓
+verify*.py → 质量校验                        （硬性规则最终门禁）
      ↓
 errors/YYYY-MM-DD-log.md                    （失败归因）
 ```
@@ -136,3 +162,12 @@ errors/YYYY-MM-DD-log.md                    （失败归因）
 - `[llm]` — LLM 配置（含 AI 质量评估参数）
 - `[article]` — 文章生成约束（字数、段落、句长等）
 - `[fetch]` — 抓取配置（延迟、超时等）
+
+## 审稿修订流程详解
+
+1. **生成初稿**：写作 Agent 读完原文后生成 Markdown 初稿
+2. **独立审稿**：审稿 Agent 从 5 个维度打分（hook/point_of_view/storyline/technical_depth/wechat_readability），总分 100，75 分通过
+3. **不通过时**：上下文记忆保留，审稿建议（2-5 条具体修改意见）喂回写作 Agent
+4. **修改再审**：写作 Agent 根据建议修改文章，重新提交审稿
+5. **循环上限**：默认最多 3 轮修订（可通过 `--llm-rewrite-attempts` 调整）
+6. **记忆清理**：全部文章审稿通过后，统一丢弃所有原文上下文
