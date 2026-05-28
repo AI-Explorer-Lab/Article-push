@@ -160,14 +160,23 @@ def fetch_original_context(item: dict) -> dict:
     raw_text = ""
     fetch_status = "failed"
     if url:
-        # 微信文章：优先使用 Selenium 浏览器抓取
-        if "mp.weixin.qq.com" in url:
+        # 微信文章 / 搜狗跳转链接：优先使用 Selenium 浏览器抓取
+        is_wechat = "mp.weixin.qq.com" in url
+        is_sogou_redirect = "weixin.sogou.com" in url and "/link?" in url
+        if is_wechat or is_sogou_redirect:
             try:
                 from src.infrastructure.browser_fetcher import (
-                    create_browser, fetch_wechat_article,
+                    create_browser, fetch_wechat_article, resolve_wechat_url,
                 )
                 with create_browser(headless=True) as driver:
-                    browser_text = fetch_wechat_article(driver, url)
+                    target_url = url
+                    if is_sogou_redirect:
+                        resolved = resolve_wechat_url(driver, url)
+                        if resolved:
+                            target_url = resolved
+                        else:
+                            raise RuntimeError("无法解析搜狗跳转链接")
+                    browser_text = fetch_wechat_article(driver, target_url)
                     if browser_text and len(browser_text) >= 300:
                         raw_text = browser_text
                         fetch_status = "fetched"

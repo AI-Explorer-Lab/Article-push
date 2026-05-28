@@ -90,6 +90,15 @@ def _create_chrome_options(headless: bool = True) -> Options:
     # 禁用自动化检测标志
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
+    # 额外反检测参数
+    options.add_argument("--disable-gpu")
+    options.add_argument("--lang=zh-CN")
+    options.add_argument("--accept-lang=zh-CN,zh;q=0.9")
+    prefs = {
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+    }
+    options.add_experimental_option("prefs", prefs)
     return options
 
 
@@ -109,10 +118,16 @@ def create_browser(headless: bool = True) -> Generator[webdriver.Chrome, None, N
         driver = webdriver.Chrome(options=options)
         driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
         driver.implicitly_wait(IMPLICIT_WAIT)
-        # 移除 navigator.webdriver 标志
-        driver.execute_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+        # 注入反检测脚本，隐藏自动化特征
+        driver.execute_script("""
+            // 移除 navigator.webdriver 标志
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            // 伪造 chrome.runtime
+            window.chrome = { runtime: {} };
+            // 伪造 plugins 和 languages
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+        """)
         yield driver
     finally:
         _restore_path(path_backup["original_path"])
@@ -438,18 +453,40 @@ def fetch_wechat_source_full(
 
     try:
         # Step 1: 搜索搜狗微信
+        # 搜狗已不支持直接 URL 带 query 参数，必须先访问首页再通过搜索框提交
         search_query = f"{account_name} {query}"
-        search_url = f"https://weixin.sogou.com/weixin?type=2&query={search_query}"
-
         try:
-            driver.get(search_url)
-            time.sleep(2)
-        except TimeoutException:
-            pass
+            # 先访问搜狗微信首页
+            driver.get("https://weixin.sogou.com/")
+            time.sleep(3)
+            # 找到搜索框并输入关键词
+            search_input = driver.find_element(By.ID, "query")
+            search_input.clear()
+            search_input.send_keys(search_query)
+            # 点击"搜文章"提交按钮
+            search_btn = driver.find_element(By.CSS_SELECTOR, "input[type='submit']")
+            search_btn.click()
+            time.sleep(4)
+            # 等待搜索结果出现
+            try:
+                WebDriverWait(driver, 8).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "li[id^='sogou_vr_']"))
+                )
+            except TimeoutException:
+                time.sleep(3)
+        except Exception as exc:
+            print(f"[browser_fetcher] 搜索框提交失败: {exc}，尝试直接 URL")
+            # 回退：尝试直接 URL
+            try:
+                driver.get(f"https://weixin.sogou.com/weixin?type=2&query={search_query}&tsn=1")
+                time.sleep(5)
+            except TimeoutException:
+                pass
 
         page_source = driver.page_source
 
         if _is_antispider(page_source):
+            print(f"[browser_fetcher] 搜狗返回验证码页，跳过")
             return articles
 
         # 解析搜索结果块
@@ -464,6 +501,9 @@ def fetch_wechat_source_full(
                 r'<li[^>]*id="sogou_vr_11002601_box_\d+"[^>]*>.*?</li>',
                 page_source, flags=re.S,
             )
+
+        if not blocks:
+            print(f"[browser_fetcher] 搜狗搜索无结果 (query={search_query[:40]}), page_len={len(page_source)})")
 
         for block in blocks:
             if len(articles) >= max_articles:

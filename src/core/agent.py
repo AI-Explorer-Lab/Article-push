@@ -182,12 +182,15 @@ def normalize_sogou_link(href: str) -> str:
 # 抓取函数
 # ---------------------------------------------------------------------------
 
-def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog]) -> list[Candidate]:
+def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog], days: int = 7) -> list[Candidate]:
     """通过 Selenium 浏览器抓取搜狗微信搜索的文章。
 
     优先使用 Selenium + Chrome 无头浏览器（绕过反爬），
     失败时回退到传统 urllib 方式（成功率低）。
+
+    自动过滤超出 days 回溯窗口的旧文章。
     """
+    cutoff_date = (datetime.now() - timedelta(days=days)).date()
     candidates: list[Candidate] = []
 
     # 策略 1: Selenium 浏览器抓取（推荐）
@@ -200,12 +203,22 @@ def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog]) -> l
             headless=True,
         )
         for article in articles:
+            published_at = article.get("published_at", "")
+            # 日期过滤：只保留 days 天内的文章
+            if published_at:
+                try:
+                    pub_date = datetime.strptime(published_at, "%Y-%m-%d").date()
+                    if pub_date < cutoff_date:
+                        print(f"  [FILTER] 过期文章（{published_at}），跳过: {article['title'][:40]}...")
+                        continue
+                except ValueError:
+                    pass
             candidates.append(
                 Candidate(
                     title=article["title"],
                     source=article["source"],
                     url=article["url"],
-                    published_at=article.get("published_at", ""),
+                    published_at=published_at,
                     snippet=article.get("snippet", ""),
                     body=article.get("body", ""),
                 )
@@ -630,7 +643,7 @@ def collect_candidates(days: int, logs: list[FetchLog]) -> list[Candidate]:
 
     # 1. 微信公众号（通过 Selenium 浏览器抓取搜狗微信搜索，失败时回退 urllib）
     for account_name, query in WECHAT_SOURCES:
-        wechat_candidates = fetch_sogou_wechat(account_name, query, logs)
+        wechat_candidates = fetch_sogou_wechat(account_name, query, logs, days=days)
         all_candidates.extend(wechat_candidates)
         time.sleep(1)
 
