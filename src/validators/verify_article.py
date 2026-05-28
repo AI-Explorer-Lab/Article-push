@@ -19,6 +19,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from src.common.verifier import VerifierResult
+from src.common.utils import chinese_char_count
 
 load_dotenv()
 
@@ -53,10 +54,6 @@ OVERUSED_TEMPLATE_PATTERNS = [
     r"最后落回一个简单问题",
     r"放回日常工作里",
 ]
-
-
-def chinese_char_count(text: str) -> int:
-    return len(re.findall(r"[\u4e00-\u9fff]", text))
 
 
 def load_deepread(path: Path | None) -> dict[str, dict]:

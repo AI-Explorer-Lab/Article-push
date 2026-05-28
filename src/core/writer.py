@@ -247,7 +247,7 @@ def build_intro(article_type: str, subject: str, claim: str, facts: list[str]) -
 # ---------------------------------------------------------------------------
 
 def build_required_terms_paragraph(item: dict) -> str:
-    """鎶?deepread 瑕佹眰鐨勫叧閿璞¤嚜鐒惰瀺鍏ユ枃绔犮€?"""
+    """把 deepread 要求的关键对象自然融入文章。"""
     plan = item.get("article_plan") or {}
     picked: list[str] = []
     for raw in plan.get("must_include") or []:
@@ -372,7 +372,7 @@ def _expand_if_short(article: str, article_type: str, subject: str, claim: str) 
 
 
 def _expand_if_short_v2(article: str, article_type: str, subject: str, claim: str) -> str:
-    """琛ヤ竴涓洿闀裤€佹洿鍍忔寮忔帹鏂囩殑鍏滃簳鐗堟湰銆?"""
+    """补一个更长、更像正式推文的兜底版本。"""
     if chinese_char_count(article) >= 1200:
         return article
 

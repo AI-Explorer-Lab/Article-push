@@ -290,7 +290,7 @@ def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog]) -> l
 
 
 def fetch_sogou_wechat_legacy(account_name: str, query: str, logs: list[FetchLog]) -> list[Candidate]:
-    """浣跨敤鎼滅嫍寰俊鑰佸叆鍙?weixin.sogou.com/weixin?type=2 鎶撳彇鏂囩珷銆?"""
+    """使用搜狗微信老入口 weixin.sogou.com/weixin?type=2 抓取文章。"""
     candidates: list[Candidate] = []
     search_query = f"{account_name} {query} MCP 2026"
     search_url = f"https://weixin.sogou.com/weixin?type=2&query={quote(search_query)}"
@@ -373,7 +373,7 @@ def fetch_sogou_wechat_legacy(account_name: str, query: str, logs: list[FetchLog
 
 
 def fetch_qbitai_posts(days: int, logs: list[FetchLog], limit: int = 6) -> list[Candidate]:
-    """QbitAI 鏈夊叕寮€ WordPress JSON锛屽彲浣滀负閲忓瓙浣嶇殑绋冲畾鏇夸唬婧愩€?"""
+    """QbitAI 有公开 WordPress JSON，可作为量子位的稳定替代源。"""
     url = "https://www.qbitai.com/wp-json/wp/v2/posts?per_page=30&orderby=date&order=desc"
     candidates: list[Candidate] = []
     try:

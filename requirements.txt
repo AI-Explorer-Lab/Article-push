@@ -1,0 +1,7 @@
+# 微信公众号推送-harness 依赖清单
+# 安装: pip install -r requirements.txt
+
+python-dotenv>=1.0.0
+
+# 可选依赖（仅在需要解析 harness.toml 一致性校验时使用）
+# tomli>=2.0.0; python_version < "3.11"

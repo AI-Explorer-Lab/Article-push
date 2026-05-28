@@ -159,7 +159,7 @@ def build_deepread(report_path: Path, deepread_path: Path, article_count: int = 
         "generation_rule": (
             "由 deepread 模块从基础日报直接生成选题。agent.py 已直接选取 5 篇候选"
             "（GitHub 最多 2 篇，其他至少 3 篇），不再经过两轮筛选。"
-            "每篇独立读取原文、独立判断质量、独立生成，写完即丢弃上下文。"
+            "每篇独立读取原文、独立判断质量、独立生成，上下文保留到审稿 Agent 通过后才丢弃。"
         ),
         "harness_episode": {
             "task_spec": "AGENT.md",
