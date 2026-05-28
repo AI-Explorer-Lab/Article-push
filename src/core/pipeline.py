@@ -21,11 +21,15 @@ import traceback
 from datetime import date
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from src.common.utils import load_json, write_json
 from src.core.deepread import build_deepread
 from src.infrastructure.error_logger import StageResult, write_error_log
 from src.core.writer import generate_articles
 from src.infrastructure.llm_client import create_llm_provider
+
+load_dotenv()
 
 
 ROOT = Path(__file__).resolve().parent.parent.parent

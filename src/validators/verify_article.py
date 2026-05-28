@@ -11,11 +11,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from src.common.verifier import VerifierResult
+
+load_dotenv()
 
 
 VALID_ARTICLE_TYPES = {"主线型", "解读型", "工具型"}
@@ -54,10 +59,6 @@ def chinese_char_count(text: str) -> int:
     return len(re.findall(r"[\u4e00-\u9fff]", text))
 
 
-def split_paragraphs(text: str) -> list[str]:
-    return [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-
-
 def load_deepread(path: Path | None) -> dict[str, dict]:
     if not path:
         return {}
@@ -72,19 +73,6 @@ def load_deepread(path: Path | None) -> dict[str, dict]:
     return mapping
 
 
-def infer_article_type(text: str) -> str | None:
-    """从文章内容推断类型。"""
-    if "github.com/" in text.lower() or "仓库" in text or "项目链接" in text:
-        return "工具型"
-    if "趋势" in text or "信号" in text:
-        return "解读型"
-    return "主线型"
-
-
-def has_any(text: str, keywords: list[str]) -> bool:
-    return any(keyword in text for keyword in keywords)
-
-
 def covered_terms(text: str, terms: list[str]) -> list[str]:
     covered: list[str] = []
     for term in terms:
@@ -96,190 +84,211 @@ def covered_terms(text: str, terms: list[str]) -> list[str]:
     return covered
 
 
-def verify_structure_by_type(text: str, article_type: str) -> tuple[list[str], list[str]]:
-    """检查文章是否覆盖了对应类型的关键内容维度。
+# ---------------------------------------------------------------------------
+# 独立审稿 Agent
+# ---------------------------------------------------------------------------
 
-    注意：不再强制要求出现特定关键词，改为检查是否有相关内容信号。
-    不通过的项作为 warnings 而非 errors，不会阻断 pipeline。
+def _create_reviewer_provider():
+    """创建审稿专用的 LLM provider。
+
+    优先使用 REVIEW_LLM_* 环境变量（独立于写作 LLM），
+    如果没有配置则 fallback 到写作 LLM（至少是不同的调用实例）。
     """
-    errors: list[str] = []
-    warnings: list[str] = []
+    from src.infrastructure.llm_client import OpenAICompatibleProvider
 
-    if article_type == "主线型":
-        groups = {
-            "事实切入": ["这次事件", "这次进展", "核心看点", "进入了", "开始参与", "解决了"],
-            "为什么重要": ["为什么", "重要", "不只是", "值得"],
-            "影响或改变": ["意味着", "影响", "改变", "进入"],
-            "后续观察": ["接下来", "后续", "应该看", "值得看"],
-        }
-    elif article_type == "解读型":
-        groups = {
-            "信号边界": ["信号", "趋势", "边界", "观察"],
-            "机制解释": ["原因", "因为", "本质", "机制", "接入方式", "成本结构", "流程"],
-            "技术含义": ["技术", "SDK", "API", "MCP", "harness", "上下文"],
-            "影响判断": ["影响", "竞争", "开发者", "行业", "接下来"],
-        }
-    elif article_type == "工具型":
-        groups = {
-            "工具定义": ["它是什么", "可以理解成", "定位"],
-            "适合人群": ["适合谁", "如果你", "值得关注"],
-            "技术看点": ["技术看点", "关键词", "我最关注"],
-            "局限提醒": ["谨慎", "局限", "风险", "需要验证", "不能只看"],
-        }
-    else:
-        errors.append(f"未知文章类型: {article_type}")
-        return errors, warnings
-
-    for label, keywords in groups.items():
-        if not has_any(text, keywords):
-            warnings.append(f"{article_type} 可能缺少内容维度: {label}（非阻断）")
-
-    return errors, warnings
-
-
-def score_article(text: str, title: str, article_type: str | None) -> tuple[int, dict[str, dict], list[str]]:
-    paragraphs = split_paragraphs(text)
-    body = "\n\n".join(paragraphs[1:]) if len(paragraphs) > 1 else text
-    intro = body[:240]
-
-    scores = {
-        "hook": 8,
-        "point_of_view": 8,
-        "storyline": 8,
-        "technical_depth": 8,
-        "wechat_readability": 8,
-    }
-    comments: dict[str, dict] = {}
-    suggestions: list[str] = []
-
-    first_sentence = re.split(r"[。！？\n]", intro.strip())[0]
-    if not has_any(intro, ["关键", "问题", "但", "反而", "边界", "流程", "成本", "接入"]):
-        scores["hook"] -= 3
-        suggestions.append("开头缺少具体问题或判断，建议前 200 字内交代对象、动作和矛盾。")
-    if intro.startswith("今天") or intro.startswith("有一类"):
-        scores["hook"] -= 3
-        suggestions.append("开头略像流水账，可以直接从冲突或判断切入。")
-    if has_any(first_sentence, ["消息", "新闻", "项目"]) and not has_any(first_sentence, ["为什么", "问题", "边界", "成本", "流程"]):
-        scores["hook"] -= 2
-        suggestions.append("第一句话过于资讯化，建议用问题、矛盾或结论打开。")
-    if "？" not in intro and "！" not in intro and not has_any(intro[:120], ["但", "反而", "边界", "流程"]):
-        scores["hook"] -= 1
-
-    if not has_any(text, ["我觉得", "本质", "关键", "分水岭", "问题在于", "取决于", "边界", "成本"]):
-        scores["point_of_view"] -= 4
-        suggestions.append("观点感偏弱，建议增加一句明确判断：这件事改动了哪段流程或暴露了什么边界。")
-    if len(re.findall(r"值得|重要|关键", text)) > 14:
-        scores["point_of_view"] -= 2
-        suggestions.append("高频判断词偏多，建议用更具体的场景替代抽象判断。")
-    if len(re.findall(r"这类|这种|这个方向|这件事", text)) > 10:
-        scores["point_of_view"] -= 1
-        suggestions.append("指代词偏多，文章容易变虚，建议补充更具体的对象和场景。")
-
-    h2_count = len(re.findall(r"^##\s+", text, flags=re.MULTILINE))
-    if h2_count < 4:
-        scores["storyline"] -= 2
-        suggestions.append("二级标题偏少，文章推进层次不够清楚。")
-    if not has_any(text[-500:], ["接下来", "如果", "未来", "这才是", "所以"]):
-        scores["storyline"] -= 2
-        suggestions.append("结尾缺少收束判断或下一步观察。")
-    headings = re.findall(r"^##\s+(.+)$", text, flags=re.MULTILINE)
-    generic_headings = sum(
-        1
-        for heading in headings
-        if any(re.search(pattern, heading) for pattern in GENERIC_HEADING_PATTERNS)
+    review_key = (
+        os.environ.get("REVIEW_LLM_API_KEY")
+        or os.environ.get("LLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
     )
-    if generic_headings >= 3:
-        scores["storyline"] -= 2
-        suggestions.append("小标题模板感较重，建议让标题带出具体判断，而不是只标功能区块。")
-    elif generic_headings > 0:
-        scores["storyline"] -= generic_headings
-        suggestions.append("部分二级标题暴露了写作结构标签，建议把\"发生了什么/为什么重要\"等融入具体判断。")
+    review_model = (
+        os.environ.get("REVIEW_LLM_MODEL")
+        or os.environ.get("LLM_MODEL")
+    )
+    review_base = (
+        os.environ.get("REVIEW_LLM_API_BASE")
+        or os.environ.get("LLM_API_BASE")
+        or "https://api.openai.com/v1"
+    )
+    if not review_key or not review_model:
+        return None
+    return OpenAICompatibleProvider(
+        api_base=review_base,
+        api_key=review_key,
+        model=review_model,
+    )
 
-    technical_terms = [
-        "Agent", "MCP", "harness", "Context Engineering", "Harness Engineering",
-        "SDK", "API", "RAG", "CI", "模型", "工具", "上下文", "评测", "工作流",
-        "权限", "路由",
-    ]
-    term_hits = sum(1 for term in technical_terms if term in text)
-    if term_hits < 4:
-        scores["technical_depth"] -= 4
-        suggestions.append("技术密度不足，建议补充具体工程概念或开发者场景。")
-    if not has_any(text, ["比如", "举个", "这就像", "可以理解成"]):
-        scores["technical_depth"] -= 3
-        suggestions.append("缺少具体例子或类比，读者理解成本会偏高。")
-    if not has_any(text, ["失败", "权限", "测试", "部署", "审查", "成本", "状态", "日志", "边界", "工作流"]):
-        scores["technical_depth"] -= 2
-        suggestions.append("缺少真实工程约束，容易像概念解读而不是技术文章。")
 
-    long_paragraphs = [p for p in paragraphs if chinese_char_count(p) > 180]
-    if long_paragraphs:
-        scores["wechat_readability"] -= min(4, len(long_paragraphs))
-        suggestions.append("存在过长段落，建议拆短以适应公众号阅读节奏。")
+def review_with_agent(
+    article_text: str,
+    article_type: str,
+    title: str,
+    source_title: str,
+    source_url: str,
+    reviewer: object,
+) -> dict:
+    """用独立的审稿 Agent 对文章做综合质量评估。
 
-    prose_paragraphs = [
-        p
-        for p in paragraphs
-        if not p.startswith("#")
-        and not p.startswith("项目链接")
-        and not re.match(r"^[-*]\s+", p)
-    ]
-    short_paragraphs = [
-        p
-        for p in prose_paragraphs
-        if chinese_char_count(p) < 45 and len(re.findall(r"[。！？]", p)) <= 1
-    ]
-    if prose_paragraphs and len(short_paragraphs) / len(prose_paragraphs) > 0.45:
-        scores["wechat_readability"] -= 3
-        suggestions.append("超短段落比例偏高，建议把连续的一两句话合并成更完整的自然段。")
+    Args:
+        article_text: 完整的 Markdown 文章
+        article_type: 文章类型（主线型/解读型/工具型）
+        title: 文章一级标题
+        source_title: 原文标题
+        source_url: 原文 URL
+        reviewer: LLM provider 实例
 
-    if chinese_char_count(text) < 1000:
-        scores["wechat_readability"] -= 5
-        suggestions.append("篇幅过短，通常还没形成完整论证。")
-    elif chinese_char_count(text) < 1200:
-        scores["wechat_readability"] -= 3
-        suggestions.append("篇幅偏短，可能还没充分展开。")
-    if chinese_char_count(text) > 3000:
-        scores["wechat_readability"] -= 2
-        suggestions.append("篇幅偏长，建议压缩重复段落。")
+    Returns:
+        {
+            "score": int (0-100),
+            "checks": {"hook": {"score": int, "comment": str}, ...},
+            "suggestions": [str, ...],
+            "passed": bool,
+            "raw_response": str,
+        }
+    """
+    system = (
+        "你是一名资深技术编辑和审稿人。你的任务是审读一篇公众号技术文章，"
+        "从多个维度给出客观评价和具体修改建议。\n\n"
+        "审稿原则：\n"
+        "- 你不是在检查清单，而是在判断「这篇文章像不像一个真人编辑写出来的」\n"
+        "- 重点看：有没有自己的判断视角、段落之间有没有自然的起承转合、"
+        "二级标题是不是有具体信息而不是空泛概括、有没有模板腔和套话\n"
+        "- 评分要诚实，不要因为文章看起来「格式正确」就给高分\n"
+        "- 如果文章写得像 AI 生成的（四段论模板、空洞的连接词、缺少具体细节），分数要明显偏低\n"
+    )
 
-    if title and title.strip("# ") in text.replace(title, "", 1):
-        scores["hook"] -= 1
+    user = f"""请审读下面这篇技术公众号文章，给出评分和修改建议。
 
-    for key, score in scores.items():
-        scores[key] = max(0, min(10, score))
+文章类型：{article_type}
+文章标题：{title}
+原文标题：{source_title}
+原文链接：{source_url}
 
-    comments["hook"] = {
-        "score": scores["hook"],
-        "comment": "开头钩子越清楚，越能避免文章像普通资讯摘要。",
+请从以下五个维度分别打分（每项 0-10 分），并给出 1-2 句简短评语：
+
+1. **hook（开头吸引力）**：开头 200 字是否快速抓住读者？是直接切入具体问题/矛盾/判断，还是泛泛的背景铺垫？
+2. **point_of_view（观点判断力）**：文章是否有自己明确的判断，而不只是复述原文信息？判断是否克制、有分寸？
+3. **storyline（结构推进感）**：二级标题是否包含具体信息？段落之间是否有自然的起承转合，而不是「首先其次最后」的模板堆砌？
+4. **technical_depth（技术深度）**：是否有具体的工程概念、技术术语、使用场景或边界条件？有没有自然的类比或例子？
+5. **wechat_readability（公众号可读性）**：段落长度是否适合手机阅读？语言是否自然、不像机器翻译？
+
+然后给出：
+- **overall_score**：总分 0-100（五项各 0-10，总分 = 五项之和 × 2）
+- **verdict**：PASS（>=75 分）或 FAIL（<75 分）
+- **suggestions**：2-5 条具体修改建议（中文，每条一句话，要具体可操作）
+
+请严格按以下 JSON 格式输出，不要加其他内容：
+```json
+{{
+  "hook": {{"score": 8, "comment": "开头直接切入矛盾，但第一句话可以更具体"}},
+  "point_of_view": {{"score": 7, "comment": "有自己的判断但部分段落还是在复述"}},
+  "storyline": {{"score": 6, "comment": "二级标题偏概括，缺少原文中的具体信息"}},
+  "technical_depth": {{"score": 7, "comment": "有技术概念但缺少边界条件和失败场景的讨论"}},
+  "wechat_readability": {{"score": 8, "comment": "段落长度合适，语言自然"}},
+  "overall_score": 72,
+  "verdict": "FAIL",
+  "suggestions": [
+    "第一条具体建议",
+    "第二条具体建议"
+  ]
+}}
+```
+
+=== 待审文章 ===
+{article_text[:8000]}
+"""
+    try:
+        response = reviewer.chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0.3,
+            max_tokens=1500,
+        )
+    except Exception as exc:
+        return {
+            "score": 0,
+            "checks": {},
+            "suggestions": [f"审稿 Agent 调用失败: {exc}"],
+            "passed": False,
+            "raw_response": str(exc),
+        }
+
+    # 解析 JSON 响应
+    try:
+        # 尝试提取 ```json ... ``` 代码块
+        json_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", response, re.S)
+        if json_match:
+            json_str = json_match.group(1).strip()
+        else:
+            json_str = response.strip()
+
+        # 尝试找到最外层的 { ... } 对
+        brace_start = json_str.find("{")
+        brace_end = json_str.rfind("}")
+        if brace_start != -1 and brace_end != -1:
+            json_str = json_str[brace_start:brace_end + 1]
+
+        data = json.loads(json_str)
+    except (json.JSONDecodeError, ValueError):
+        return {
+            "score": 0,
+            "checks": {},
+            "suggestions": [f"审稿 Agent 返回格式异常，无法解析: {response[:300]}"],
+            "passed": False,
+            "raw_response": response,
+        }
+
+    score = int(data.get("overall_score", 0))
+    checks = {
+        "hook": {
+            "score": int(data.get("hook", {}).get("score", 5)),
+            "comment": str(data.get("hook", {}).get("comment", "")),
+        },
+        "point_of_view": {
+            "score": int(data.get("point_of_view", {}).get("score", 5)),
+            "comment": str(data.get("point_of_view", {}).get("comment", "")),
+        },
+        "storyline": {
+            "score": int(data.get("storyline", {}).get("score", 5)),
+            "comment": str(data.get("storyline", {}).get("comment", "")),
+        },
+        "technical_depth": {
+            "score": int(data.get("technical_depth", {}).get("score", 5)),
+            "comment": str(data.get("technical_depth", {}).get("comment", "")),
+        },
+        "wechat_readability": {
+            "score": int(data.get("wechat_readability", {}).get("score", 5)),
+            "comment": str(data.get("wechat_readability", {}).get("comment", "")),
+        },
     }
-    comments["point_of_view"] = {
-        "score": scores["point_of_view"],
-        "comment": "公众号文章需要有明确判断，而不只是解释新闻。",
-    }
-    comments["storyline"] = {
-        "score": scores["storyline"],
-        "comment": "结构需要有推进感：事实、解释、影响、观察。",
-    }
-    comments["technical_depth"] = {
-        "score": scores["technical_depth"],
-        "comment": "技术深度来自具体概念、工程场景和边界条件。",
-    }
-    comments["wechat_readability"] = {
-        "score": scores["wechat_readability"],
-        "comment": "短段落、明确小标题和具体例子会提升可读性。",
+    suggestions = [str(s) for s in data.get("suggestions", [])]
+    verdict = str(data.get("verdict", "FAIL")).upper()
+    passed = verdict == "PASS" and score >= 75
+
+    return {
+        "score": max(0, min(100, score)),
+        "checks": checks,
+        "suggestions": suggestions,
+        "passed": passed,
+        "raw_response": response,
     }
 
-    total = round(sum(scores.values()) * 2)
-    if article_type not in VALID_ARTICLE_TYPES:
-        total -= 5
-        suggestions.append("未能确定文章类型，建议从 deepread 中传入对应 article_type。")
-    return max(0, min(100, total)), comments, suggestions
 
-
-def verify_article(path: Path, deepread_item: dict | None = None) -> dict:
+def verify_article(
+    path: Path,
+    deepread_item: dict | None = None,
+    reviewer: object | None = None,
+) -> dict:
     """验证单篇 Markdown 文章。
 
     可通过 import 直接调用，返回包含 passed/errors/warnings/score 等字段的 dict。
+
+    硬性规则检查（文件名、字数、禁止词等）仍然用规则；
+    内容质量评估交给独立的审稿 Agent。
+
+    Args:
+        path: 文章文件路径
+        deepread_item: deepread 中的对应条目
+        reviewer: 审稿 Agent（LLM provider 实例）。如果为 None 则自动创建
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -295,6 +304,7 @@ def verify_article(path: Path, deepread_item: dict | None = None) -> dict:
             "rewrite_suggestions": [],
         }
 
+    # ---- 硬性规则检查 ----
     if path.suffix.lower() != ".md":
         errors.append("文件扩展名必须是 .md")
 
@@ -318,18 +328,6 @@ def verify_article(path: Path, deepread_item: dict | None = None) -> dict:
     h2_count = len(re.findall(r"^##\s+", text, flags=re.MULTILINE))
     if h2_count < 3:
         errors.append(f"至少需要 3 个二级标题，当前为 {h2_count} 个")
-
-    h2_titles = re.findall(r"^##\s+(.+)$", text, flags=re.MULTILINE)
-    exposed_headings = [
-        heading
-        for heading in h2_titles
-        if any(re.search(pattern, heading) for pattern in GENERIC_HEADING_PATTERNS)
-    ]
-    if exposed_headings:
-        warnings.append(
-            "二级标题不应直接暴露结构标签，建议改成具体判断: "
-            + "；".join(exposed_headings)
-        )
 
     char_count = chinese_char_count(text)
     if char_count < 1000:
@@ -364,29 +362,58 @@ def verify_article(path: Path, deepread_item: dict | None = None) -> dict:
                     f"{len(covered)}/{len(must_include)}，至少需要 {min_required}"
                 )
 
+    # ---- 确定文章类型 ----
     article_type = None
     if deepread_item:
         article_type = deepread_item.get("article_type")
     if not article_type:
-        article_type = infer_article_type(text)
+        # 简单推断作为 fallback
+        if "github.com/" in text.lower() or "仓库" in text or "项目链接" in text:
+            article_type = "工具型"
+        elif "趋势" in text or "信号" in text:
+            article_type = "解读型"
+        else:
+            article_type = "主线型"
 
-    if article_type:
-        struct_errors, struct_warnings = verify_structure_by_type(text, article_type)
-        errors.extend(struct_errors)
-        warnings.extend(struct_warnings)
+    # ---- 审稿 Agent 评估 ----
+    source_title = str(deepread_item.get("title", "")) if deepread_item else ""
+    source_url = str(deepread_item.get("url", "")) if deepread_item else ""
+
+    if reviewer is None:
+        reviewer = _create_reviewer_provider()
+
+    if reviewer is not None:
+        review_result = review_with_agent(
+            article_text=text,
+            article_type=article_type,
+            title=title,
+            source_title=source_title,
+            source_url=source_url,
+            reviewer=reviewer,
+        )
+        score = review_result["score"]
+        checks = review_result["checks"]
+        suggestions = review_result["suggestions"]
+        agent_passed = review_result["passed"]
     else:
-        warnings.append("无法推断文章类型，跳过类别结构校验")
+        # 没有审稿 Agent 时，用简单规则做 fallback 评分
+        score = min(100, max(40, 60 + h2_count * 2))
+        checks = {}
+        suggestions = []
+        agent_passed = True
+        warnings.append("审稿 Agent 未配置（REVIEW_LLM_API_KEY / REVIEW_LLM_MODEL），使用简单评分")
 
-    score, checks, suggestions = score_article(text, title, article_type)
     if score < 75:
-        warnings.append(f"编辑评分低于发布门槛 75: {score}")
+        warnings.append(f"审稿评分低于发布门槛 75: {score}")
     elif score < 85:
-        warnings.append(f"编辑评分可用但建议润色: {score}")
+        warnings.append(f"审稿评分可用但建议润色: {score}")
+
+    passed = len(errors) == 0 and agent_passed
 
     return {
         "file": str(path),
         "article_type": article_type,
-        "passed": len(errors) == 0 and score >= 75,
+        "passed": passed,
         "errors": errors,
         "warnings": warnings,
         "score": score,
@@ -405,7 +432,7 @@ def print_result(result: dict, verbose: bool) -> None:
     print(f"\n{'=' * 60}")
     print(f"文章: {result['file']}")
     print(f"类型: {result.get('article_type') or '未知'}")
-    print(f"评分: {result['score']}")
+    print(f"评分: {result['score']} (审稿 Agent)")
     print(f"结果: {'PASS' if result['passed'] else 'FAIL'}")
     print(f"{'=' * 60}")
 
@@ -414,32 +441,49 @@ def print_result(result: dict, verbose: bool) -> None:
     for msg in result["warnings"]:
         print(f"WARN: {msg}")
 
-    if verbose:
+    if verbose and result.get("checks"):
+        print("审稿细项:")
         for name, detail in result["checks"].items():
-            print(f"- {name}: {detail['score']}/10 - {detail['comment']}")
-    if result["rewrite_suggestions"]:
-        print("重写建议:")
+            if isinstance(detail, dict):
+                print(f"  [{detail.get('score', '?')}/10] {name}: {detail.get('comment', '')}")
+    if result.get("rewrite_suggestions"):
+        print("修改建议:")
         for suggestion in result["rewrite_suggestions"]:
-            print(f"- {suggestion}")
+            print(f"  - {suggestion}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="验证 daily_paper Markdown 成稿质量。")
+    parser = argparse.ArgumentParser(description="验证 daily_paper Markdown 成稿质量（审稿 Agent 模式）。")
     parser.add_argument("target", help="Markdown 文件路径或 daily_paper 目录")
     parser.add_argument("--deepread", help="对应的 reports/YYYY-MM-DD.deepread.json")
     parser.add_argument("--json", action="store_true", help="输出 JSON 结果")
     parser.add_argument("--verbose", action="store_true", help="打印细项评分")
+    parser.add_argument("--no-agent", action="store_true", help="禁用审稿 Agent，使用简单规则评分")
     args = parser.parse_args()
 
     deepread_map = load_deepread(Path(args.deepread)) if args.deepread else {}
     paths = collect_article_paths(Path(args.target))
+
+    reviewer = None
+    if not args.no_agent:
+        reviewer = _create_reviewer_provider()
+        if reviewer:
+            print(f"[审稿 Agent] 已启用: {reviewer.model}")
+        else:
+            print("[审稿 Agent] 未配置（REVIEW_LLM_API_KEY / REVIEW_LLM_MODEL），使用简单评分")
+
     results = []
     for path in paths:
         item = deepread_map.get(path.name)
-        results.append(verify_article(path, item))
+        results.append(verify_article(path, item, reviewer=reviewer))
 
     if args.json:
-        print(json.dumps(results, ensure_ascii=False, indent=2))
+        # JSON 输出时不包含 raw_response
+        clean_results = []
+        for r in results:
+            r_clean = {k: v for k, v in r.items() if k != "raw_response"}
+            clean_results.append(r_clean)
+        print(json.dumps(clean_results, ensure_ascii=False, indent=2))
     else:
         for result in results:
             print_result(result, args.verbose)
