@@ -1,9 +1,10 @@
-"""src/core/writer.py - 文章写作模块（精简版）。
+"""src/core/writer.py - 文章写作模块。
 
-新架构（精简后）：
+架构：
 - 获取链接元数据后，用 AI 阅读原文判断质量（好不好）
 - 好的就生成 MD 文章，不好就跳过下一个
-- 每读完一篇生成完，立即丢弃上下文记忆
+- 生成初稿后保留上下文记忆（original_text），等审稿 Agent 通过后再丢弃
+- 审稿不通过时，用审稿建议 + 原文上下文让 LLM 修改文章
 - 目标产出 5 篇文章，GitHub 最多 2 篇
 """
 
@@ -411,14 +412,19 @@ def generate_articles(
     llm_provider: OpenAICompatibleProvider | None = None,
     llm_rewrite_attempts: int = 0,
     llm_max_original_chars: int = 120000,
-) -> None:
+) -> tuple[list[dict], dict[str, dict]]:
     """从 deepread 逐篇评估并生成文章。
 
-    新流程：
+    流程：
     1. 对每篇候选，先用 AI 阅读原文判断质量
     2. 好的就生成 MD 文章，不好的跳过
-    3. 每读完一篇生成完，立即丢弃上下文
+    3. 生成初稿后保留上下文（original_text），等审稿 Agent 通过后再丢弃
     4. 最多产出 5 篇文章，GitHub 最多 2 篇
+
+    Returns:
+        (article_states, contexts): article_states 是状态列表，
+        contexts 是 {output_filename: context_dict} 的映射，
+        调用方在审稿全部通过后调用 discard_contexts() 清理。
     """
     data = load_json(deepread_path)
     paper_dir = root / "daily_paper"
@@ -428,6 +434,7 @@ def generate_articles(
 
     items = data.get("selected_items", [])
     article_states: list[dict] = []
+    contexts: dict[str, dict] = {}  # {output_filename: context_dict}
 
     github_count = 0
     generated_count = 0
@@ -456,7 +463,7 @@ def generate_articles(
             "article_type": item.get("article_type", ""),
             "output_file": item.get("output_file", ""),
             "context_scope": "single_article",
-            "memory_policy": "discard_after_write",
+            "memory_policy": "retain_until_review_pass",
             "stage": "pending",
         }
 
@@ -519,6 +526,8 @@ def generate_articles(
                 "char_count": chinese_char_count(text),
                 "writer": "llm" if (use_llm_writer and llm_provider) else "rule_based",
             })
+            # 保留上下文，等审稿通过后再丢弃
+            contexts[output.name] = context
         except Exception as exc:
             print(f"  [FAIL] 生成失败: {exc}")
             article_states.append({
@@ -526,21 +535,115 @@ def generate_articles(
                 "stage": "failed_generate",
                 "error": str(exc),
             })
-        finally:
-            # 丢弃上下文
             context.pop("original_text", None)
             del context
 
     print(f"\n[STATS] 生成统计: {generated_count} 篇 (GitHub: {github_count}, 其他: {generated_count - github_count})")
+    print(f"[MEMORY] 保留 {len(contexts)} 篇文章的上下文，等待审稿")
 
-    # 写入状态文件
+    # 暂不写入状态文件——等审稿循环完成后再写最终状态
+    return article_states, contexts
+
+
+def discard_contexts(contexts: dict[str, dict]) -> None:
+    """清理所有保留的上下文记忆（在审稿全部通过后调用）。"""
+    for name, ctx in contexts.items():
+        ctx.pop("original_text", None)
+    contexts.clear()
+    print(f"[MEMORY] 已丢弃所有上下文记忆")
+
+
+def revise_article_with_review_feedback(
+    article_text: str,
+    original_text: str,
+    item: dict,
+    review_suggestions: list[str],
+    review_checks: dict,
+    llm_provider: OpenAICompatibleProvider,
+) -> str:
+    """根据审稿 Agent 的反馈修改文章。
+
+    Args:
+        article_text: 当前文章全文
+        original_text: 原文全文
+        item: deepread 条目（含 article_type、title 等）
+        review_suggestions: 审稿 Agent 的修改建议列表
+        review_checks: 审稿 Agent 的五维度评分详情
+        llm_provider: 写作 LLM provider
+
+    Returns:
+        修改后的 Markdown 文章
+    """
+    article_type = item.get("article_type", "")
+    title = item.get("title", "")
+    plan = item.get("article_plan") or {}
+
+    # 把审稿建议格式化为具体指令
+    suggestions_text = "\n".join(f"- {s}" for s in review_suggestions)
+    checks_text = ""
+    for name, detail in review_checks.items():
+        if isinstance(detail, dict):
+            checks_text += f"- {name}: {detail.get('score', '?')}/10 — {detail.get('comment', '')}\n"
+
+    system = (
+        "你是一名技术公众号编辑。审稿人已经读完了你的文章并给出了修改建议。\n"
+        "请根据审稿建议逐条修改文章，不要敷衍，不要只改几个词。\n"
+        "修改原则：\n"
+        "- 如果审稿人说开头不够抓人，就重写开头，用具体的事实或矛盾切入\n"
+        "- 如果审稿人说观点太弱，就加入自己的明确判断（但判断要克制有分寸）\n"
+        "- 如果审稿人说结构模板化，就重新组织段落顺序和二级标题\n"
+        "- 如果审稿人说技术深度不够，就补充原文中的具体技术细节\n"
+        "- 如果审稿人说语言像机翻，就重写成自然的中文表达\n"
+        "- 不要删除原文中有价值的事实信息\n"
+        "- 保持文章风格：技术博客 + 行业观察\n"
+    )
+
+    user = f"""以下是审稿人对你文章的评价和修改建议，请据此修改文章。
+
+【文章类型】{article_type}
+【原标题】{title}
+
+【审稿细项评分】
+{checks_text}
+
+【修改建议】
+{suggestions_text}
+
+【当前文章】
+{article_text[:6000]}
+
+【原文全文（参考，不要新增原文没有的事实）】
+{original_text[:120000]}
+
+请输出修改后的完整 Markdown 文章，以一级标题开头。
+"""
+    response = llm_provider.chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.5,
+    )
+    return polish_llm_article(response, article_type)
+
+
+def save_article_states(
+    deepread_path: Path,
+    root: Path,
+    article_states: list[dict],
+    generated_count: int,
+    github_count: int,
+) -> None:
+    """写入最终的文章状态文件（审稿循环完成后调用）。"""
+    from src.common.utils import load_json, write_json
+
+    data = load_json(deepread_path)
+    states_dir = root / "states"
+    states_dir.mkdir(parents=True, exist_ok=True)
     write_json(
         states_dir / f"{data['date']}.article_states.json",
         {
             "date": data["date"],
             "source_deepread": str(deepread_path.relative_to(root)).replace("/", "\\"),
             "generation_summary": {
-                "total_selected": len(items),
+                "total_selected": len(data.get("selected_items", [])),
                 "generated": generated_count,
                 "github_count": github_count,
                 "non_github_count": generated_count - github_count,
@@ -548,9 +651,9 @@ def generate_articles(
             "harness_layers": {
                 "context": "deepread 只保存当前文章需要的选择理由、写作计划和关键对象。",
                 "tools": "抓取、评估、生成和验证由固定脚本执行。",
-                "orchestration": "pipeline.py 串联日报、deepread、文章和验证阶段。",
-                "memory_state": "当天状态写入本文件；单篇上下文写完即丢弃。",
-                "evaluation_observation": "每篇生成前用 AI 评估原文质量，不好就跳过。",
+                "orchestration": "pipeline.py 串联日报、deepread、文章生成、审稿修订和验证阶段。",
+                "memory_state": "单篇上下文保留到审稿 Agent 通过后才丢弃；不通过则带着审稿意见修改。",
+                "evaluation_observation": "每篇生成前用 AI 评估原文质量，不好就跳过；生成后用独立审稿 Agent 做五维度评分。",
                 "constraints_recovery": "失败阶段写入 errors/，长期规则需人工确认。",
             },
             "state_policy": "短期状态只记录当天 pipeline episode；跨天长期记忆只进入 AGENT.md。",
