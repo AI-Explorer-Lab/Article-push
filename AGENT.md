@@ -1,14 +1,16 @@
-# AGENT.md - 微信公众号推送 Harness 规则契约（精简版）
+# AGENT.md - 微信公众号推送 Harness 规则契约（v2.3 审稿修订增强版）
 
 ## 任务目标
 追踪前沿 AI 技术动态，生成可验证、可归档、可发布到公众号的文章。
 
 ## 核心原则（精简后）
-- **直接选 5 篇**：不再先抓 10 篇再挑 5 篇，agent.py 直接抓取并筛选 5 篇候选
+- **直接选 5 篇**：agent.py 直接抓取并筛选 5 篇候选
 - **GitHub 最多 2 篇**，微信公众号/媒体/博客至少 3 篇
 - **AI 评估质量**：获取链接元数据后，用 AI 阅读原文判断好不好，好的生成 MD，不好就跳过
 - **逐篇处理**：每读完一篇生成完，保留上下文记忆直到审稿 Agent 通过后才丢弃
 - **来源真实**：所有 URL 必须真实可访问
+- **无 deepread 中间层**：report JSON 直接驱动 writer，文章类型推断和路径生成内嵌在 writer 中
+- **审稿修订有明确边界**：每篇最多 N 轮修改，连续退化自动终止
 
 ## 信息源
 优先搜索以下来源：
@@ -59,10 +61,29 @@ URL 必须真实；`relevance` 为 1-5，低于 3 的内容不要收录。
 - 同一 URL 不要重复收录
 - 默认收录 5 条（GitHub 最多 2 条，微信公众号/媒体/博客至少 3 条）
 
-## 深度阅读中间文件规则
-深度阅读文件为 `reports/YYYY-MM-DD.deepread.json`，用于从基础日报中确认选题计划。
+## 深度阅读中间文件规则（v2.2 已移除）
+v2.2 起不再生成 `reports/YYYY-MM-DD.deepread.json`。writer 直接从 report JSON 的 `items` 读取候选，
+内嵌完成文章类型推断（infer_article_type）、标题生成（article_title）和输出路径生成（unique_output_file）。
 
-结构必须与 `verify_deepread.py` 和 `pipeline.py` 一致。`selected_items` 为 5 条。
+## 审稿修订循环规则（v2.3 新增）
+每篇文章的审稿→修改→再审流程：
+
+**轮数上限**：
+- 默认最多 3 轮（通过 `harness.toml` 的 `[llm].review_max_rounds` 配置）
+- 可通过 `--llm-rewrite-attempts N` 命令行参数临时覆盖
+
+**逐轮策略升级**：
+- 第 1 轮：gentle（温和修改，temperature 0.5）— 针对性修补扣分项
+- 第 2 轮：moderate（强化修改，temperature 0.7）— 更大幅度改写段落和标题
+- 第 3+ 轮：aggressive（强力重构，temperature 0.8）— 允许重写开头、重组结构
+
+**退化检测**：
+- 连续 3 轮评分不升反降 → 提前终止修改，标记为 `review_degraded`
+- 上轮评分下降超过 5 分 → 自动跳过当前策略档位，进入下一档强度
+
+**通过门槛**：
+- 审稿评分 ≥ 65 分即通过（通过 `harness.toml` 的 `[llm].review_pass_score` 配置）
+- 审稿 Agent 使用独立的 `REVIEW_LLM_*` 环境变量，与写作 LLM 隔离
 
 ## 公众号推文编辑规则
 每条深挖新闻生成一篇独立 Markdown，保存为 `daily_paper/YYYY-MM-DD-文章标题.md`。
@@ -104,11 +125,13 @@ python -m src.core.pipeline --date YYYY-MM-DD [--use-llm-writer]
 读取 AGENT.md
 -> agent.py 直接抓取 5 篇候选（GitHub 最多 2，其他至少 3）
 -> verify.py 验证基础日报
--> deepread 确认选题计划
--> writer 逐篇 AI 评估 + 生成 MD（好的写，不好跳过）
--> 审稿 Agent 独立评审 → 不通过则修改 → 再审（最多 N 轮）
+-> writer 直接从 report JSON 逐篇 AI 评估 + 生成 MD（好的写，不好跳过）
+-> 审稿修订循环（最多 N 轮，逐轮策略升级，退化检测）:
+    审稿 Agent 独立评审 → 不通过则修改 → 再审
+    - gentle (R1) → moderate (R2) → aggressive (R3+)
+    - 连续 3 轮评分下降 → 提前终止
 -> 审稿通过后丢弃上下文记忆
--> verify_deepread.py + verify_article.py 验证
+-> verify_article.py 逐篇验证
 ```
 
 ## 短期状态规则

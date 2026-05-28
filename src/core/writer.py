@@ -1,11 +1,13 @@
 """src/core/writer.py - 文章写作模块。
 
-架构：
-- 获取链接元数据后，用 AI 阅读原文判断质量（好不好）
+架构（精简版 v2.2）：
+- 直接从 agent.py 的 report JSON 读取 items
+- 用 AI 阅读原文判断质量（好不好）
 - 好的就生成 MD 文章，不好就跳过下一个
 - 生成初稿后保留上下文记忆（original_text），等审稿 Agent 通过后再丢弃
 - 审稿不通过时，用审稿建议 + 原文上下文让 LLM 修改文章
 - 目标产出 5 篇文章，GitHub 最多 2 篇
+- 文章类型推断、标题生成、输出路径生成等逻辑内嵌在本模块
 """
 
 from __future__ import annotations
@@ -16,14 +18,108 @@ import subprocess
 import sys
 from pathlib import Path
 
-from src.common.utils import chinese_char_count, load_json, write_json
-from src.core.deepread import STYLE_CONTRACTS
+from src.common.utils import chinese_char_count, load_json, slugify, write_json
 from src.core.context import (
+    extract_required_terms,
     fact_or_fallback,
     fetch_original_context,
     source_subject,
 )
 from src.infrastructure.llm_client import OpenAICompatibleProvider
+
+
+# ---------------------------------------------------------------------------
+# 文章类型风格契约（从 deepread.py 迁移）
+# ---------------------------------------------------------------------------
+
+STYLE_CONTRACTS = {
+    "主线型": {
+        "position": "围绕一条具体事件推进，先讲清楚原文发生了什么，再解释为什么重要。",
+        "must_answer": ["发生了什么", "谁做了什么", "为什么值得单独写", "后续应该看什么"],
+        "tone": "事实密度优先，判断跟在事实后面，不写空泛趋势口号。",
+    },
+    "解读型": {
+        "position": "围绕一个趋势或技术信号展开，原文事实是证据，文章重点是解释变化背后的原因。",
+        "must_answer": ["趋势是什么", "原文事实如何支撑趋势", "技术含义是什么", "对行业或开发者有什么影响"],
+        "tone": "解释要克制，避免把单条新闻拔高成确定趋势。",
+    },
+    "工具型": {
+        "position": "围绕工具、项目或产品展开，先说明它是什么，再说明适合谁、边界在哪里。",
+        "must_answer": ["它是什么", "适合谁", "技术看点是什么", "局限和验证点是什么"],
+        "tone": "少写宣传词，多写使用场景、失败路径和工程约束。",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# 工具函数（从 deepread.py 迁移）
+# ---------------------------------------------------------------------------
+
+def infer_article_type(item: dict) -> str:
+    """根据条目信息推断文章类型。"""
+    source = str(item.get("source", ""))
+    title = str(item.get("title", ""))
+    category = str(item.get("category", ""))
+    url = str(item.get("url", ""))
+    text = f"{source} {title} {category} {url}".lower()
+    if "github.com" in text or "github" in source.lower():
+        return "工具型"
+    if any(word in text for word in ["sdk", "api", "mcp", "context", "harness", "openai"]):
+        return "解读型"
+    return "主线型"
+
+
+def article_title(item: dict, article_type: str) -> str:
+    """根据条目和类型生成文章标题。"""
+    title = str(item.get("title", "")).strip(" .")
+    compact = re.sub(r"GitHub 项目更新：", "", title)
+    compact = compact.replace("！", "").replace("？", "")
+    return compact[:50]
+
+
+def _source_subject(item: dict) -> str:
+    """从条目中提取主题短名。"""
+    title = str(item.get("title", "这条 AI 动态"))
+    title = re.sub(r"GitHub 项目更新：", "", title)
+    return title.strip(" .")[:42] or "这条 AI 动态"
+
+
+def unique_output_file(day: str, title: str, item: dict, used_outputs: set[str]) -> str:
+    """为文章生成唯一的输出文件路径。"""
+    base = slugify(title)
+    output = f"daily_paper/{day}-{base}.md"
+    if output not in used_outputs:
+        used_outputs.add(output)
+        return output
+
+    hint = slugify(_source_subject(item), max_len=18)
+    output = f"daily_paper/{day}-{base}-{hint}.md"
+    counter = 2
+    while output in used_outputs:
+        output = f"daily_paper/{day}-{base}-{hint}-{counter}.md"
+        counter += 1
+    used_outputs.add(output)
+    return output
+
+
+def selection_reason(item: dict, article_type: str) -> str:
+    """生成选择理由。"""
+    category = item.get("category", "AI")
+    if article_type == "工具型":
+        return f"该条目具备工具或项目属性，且与 {category} 相关，适合写成工程落地和边界分析。"
+    if article_type == "解读型":
+        return f"该条目体现开发者入口、上下文或基础设施变化，适合围绕 {category} 做趋势解读。"
+    return f"该条目相关度较高，具备事件切入和传播冲突点，适合围绕 {category} 写成主线型文章。"
+
+
+def core_claim(item: dict, article_type: str) -> str:
+    """生成文章核心判断。"""
+    category = item.get("category", "AI")
+    if article_type == "工具型":
+        return "Agent 工具的价值要落到状态、权限、部署、失败和审查这些生产问题上。"
+    if article_type == "解读型":
+        return "这类动态的重点不是单点功能，而是 AI 正在争夺进入真实系统的工程入口。"
+    return f"这次事件暴露了 {category} 进入工程化阶段后必须处理的新门槛。"
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +501,7 @@ def _expand_if_short_v2(article: str, article_type: str, subject: str, claim: st
 # ---------------------------------------------------------------------------
 
 def generate_articles(
-    deepread_path: Path,
+    report_path: Path,
     root: Path,
     overwrite: bool = False,
     use_llm_writer: bool = True,
@@ -413,26 +509,27 @@ def generate_articles(
     llm_rewrite_attempts: int = 0,
     llm_max_original_chars: int = 120000,
 ) -> tuple[list[dict], dict[str, dict]]:
-    """从 deepread 逐篇评估并生成文章。
+    """从 report JSON 逐篇评估并生成文章。
 
     流程：
-    1. 对每篇候选，先用 AI 阅读原文判断质量
-    2. 好的就生成 MD 文章，不好的跳过
-    3. 生成初稿后保留上下文（original_text），等审稿 Agent 通过后再丢弃
-    4. 最多产出 5 篇文章，GitHub 最多 2 篇
+    1. 直接读取 agent.py 产出的 report JSON（reports/{date}.json）
+    2. 对每篇候选：推断文章类型 → 生成输出路径 → 抓取原文 → AI 评估质量
+    3. 好的就生成 MD 文章，不好的跳过
+    4. 生成初稿后保留上下文（original_text），等审稿 Agent 通过后再丢弃
+    5. 最多产出 5 篇文章，GitHub 最多 2 篇
 
     Returns:
         (article_states, contexts): article_states 是状态列表，
         contexts 是 {output_filename: context_dict} 的映射，
         调用方在审稿全部通过后调用 discard_contexts() 清理。
     """
-    data = load_json(deepread_path)
+    data = load_json(report_path)
     paper_dir = root / "daily_paper"
     states_dir = root / "states"
     paper_dir.mkdir(parents=True, exist_ok=True)
     states_dir.mkdir(parents=True, exist_ok=True)
 
-    items = data.get("selected_items", [])
+    items = data.get("items", [])
     article_states: list[dict] = []
     contexts: dict[str, dict] = {}  # {output_filename: context_dict}
 
@@ -440,11 +537,13 @@ def generate_articles(
     generated_count = 0
     MAX_GITHUB = 2
     TARGET_ARTICLES = 5
+    used_outputs: set[str] = set()
 
     for item in items:
-        # GitHub 最多 2 篇
         url = item.get("url", "")
         is_github = "github.com/" in url.lower()
+
+        # GitHub 最多 2 篇
         if is_github and github_count >= MAX_GITHUB:
             print(f"  SKIP (GitHub 已达上限): {item.get('title', '')[:50]}")
             article_states.append({
@@ -455,13 +554,18 @@ def generate_articles(
             })
             continue
 
-        output = root / item["output_file"]
+        # 推断文章类型并生成输出路径
+        article_type = infer_article_type(item)
+        title = article_title(item, article_type)
+        output_file = unique_output_file(data["date"], title, item, used_outputs)
+        output = root / output_file
+
         base_state = {
             "date": data.get("date"),
             "title": item.get("title", ""),
             "url": url,
-            "article_type": item.get("article_type", ""),
-            "output_file": item.get("output_file", ""),
+            "article_type": article_type,
+            "output_file": output_file,
             "context_scope": "single_article",
             "memory_policy": "retain_until_review_pass",
             "stage": "pending",
@@ -475,9 +579,27 @@ def generate_articles(
             generated_count += 1
             continue
 
-        # Step 1: 抓取原文上下文
+        # Step 1: 构建增强的 item（注入 article_type 和 article_plan，供 context/writer 使用）
+        source_text = " ".join(
+            str(item.get(key, "")) for key in ["title", "summary", "insight", "category"]
+        )
+        must_include = extract_required_terms(source_text, item.get("url", ""))
+        enhanced_item = {
+            **item,
+            "article_type": article_type,
+            "selection_reason": selection_reason(item, article_type),
+            "article_plan": {
+                "title": title,
+                "core_claim": core_claim(item, article_type),
+                "must_include": must_include,
+                "original_summary": item.get("summary", ""),
+                "original_insight": item.get("insight", ""),
+            },
+        }
+
+        # Step 2: 抓取原文上下文
         print(f"\n  [READ] {item.get('title', '')[:50]}...")
-        context = fetch_original_context(item)
+        context = fetch_original_context(enhanced_item)
         original_text = str(context.get("original_text") or "")
 
         if len(original_text) < 300:
@@ -487,7 +609,7 @@ def generate_articles(
             del context
             continue
 
-        # Step 2: AI 评估质量（如果用 LLM writer）
+        # Step 3: AI 评估质量（如果用 LLM writer）
         if use_llm_writer and llm_provider:
             print(f"  [EVAL] AI 评估质量中...")
             passed, reason = evaluate_article_quality_with_ai(item, original_text, llm_provider)
@@ -502,15 +624,15 @@ def generate_articles(
                 del context
                 continue
 
-        # Step 3: 生成文章
+        # Step 4: 生成文章
         output.parent.mkdir(parents=True, exist_ok=True)
         try:
             if use_llm_writer and llm_provider:
                 print(f"  [WRITE] LLM 生成文章中...")
-                text = rewrite_one_article_with_llm(item, context, llm_provider)
+                text = rewrite_one_article_with_llm(enhanced_item, context, llm_provider)
             else:
                 print(f"  [WRITE] 规则模板生成文章中...")
-                text = rewrite_one_article_rules(item, context)
+                text = rewrite_one_article_rules(enhanced_item, context)
 
             output.write_text(text, encoding="utf-8")
             print(f"  [DONE] 生成完成: {output.relative_to(root)} ({chinese_char_count(text)} 字)")
@@ -560,16 +682,19 @@ def revise_article_with_review_feedback(
     review_suggestions: list[str],
     review_checks: dict,
     llm_provider: OpenAICompatibleProvider,
+    strategy: dict | None = None,
 ) -> str:
     """根据审稿 Agent 的反馈修改文章。
 
     Args:
         article_text: 当前文章全文
         original_text: 原文全文
-        item: deepread 条目（含 article_type、title 等）
+        item: 条目信息（含 article_type、title 等）
         review_suggestions: 审稿 Agent 的修改建议列表
         review_checks: 审稿 Agent 的五维度评分详情
         llm_provider: 写作 LLM provider
+        strategy: 修改策略 {"label": str, "temperature": float, "description": str}
+                  不同轮次使用不同策略强度，防止温和修补无效果
 
     Returns:
         修改后的 Markdown 文章
@@ -578,6 +703,10 @@ def revise_article_with_review_feedback(
     title = item.get("title", "")
     plan = item.get("article_plan") or {}
 
+    # 使用策略参数（默认温和策略）
+    if strategy is None:
+        strategy = {"label": "gentle", "temperature": 0.5, "description": "温和修改"}
+
     # 把审稿建议格式化为具体指令
     suggestions_text = "\n".join(f"- {s}" for s in review_suggestions)
     checks_text = ""
@@ -585,20 +714,50 @@ def revise_article_with_review_feedback(
         if isinstance(detail, dict):
             checks_text += f"- {name}: {detail.get('score', '?')}/10 — {detail.get('comment', '')}\n"
 
-    system = (
-        "你是一名技术公众号编辑。审稿人已经读完了你的文章并给出了修改建议。\n"
-        "请根据审稿建议逐条修改文章，不要敷衍，不要只改几个词。\n"
-        "修改原则：\n"
-        "- 如果审稿人说开头不够抓人，就重写开头，用具体的事实或矛盾切入\n"
-        "- 如果审稿人说观点太弱，就加入自己的明确判断（但判断要克制有分寸）\n"
-        "- 如果审稿人说结构模板化，就重新组织段落顺序和二级标题\n"
-        "- 如果审稿人说技术深度不够，就补充原文中的具体技术细节\n"
-        "- 如果审稿人说语言像机翻，就重写成自然的中文表达\n"
-        "- 不要删除原文中有价值的事实信息\n"
-        "- 保持文章风格：技术博客 + 行业观察\n"
-    )
+    # 根据策略强度调整 system prompt
+    strategy_label = strategy.get("label", "gentle")
+
+    if "aggressive" in strategy_label:
+        system = (
+            "你是一名技术公众号编辑。审稿人已经多次审读了你的文章并反复给出了修改建议，"
+            "文章仍存在明显问题。\n"
+            "这次需要做大幅度修改，不要只改几个词：\n"
+            "- 可以重写开头，用完全不同的切入点\n"
+            "- 可以重组文章结构，调整二级标题和段落顺序\n"
+            "- 如果某些段落实在改不好，可以直接重写整段\n"
+            "- 模板化的表达全部替换成具体、自然的写法\n"
+            "- 不要删除原文中有价值的事实信息\n"
+            "- 保持文章风格：技术博客 + 行业观察\n"
+        )
+    elif "moderate" in strategy_label:
+        system = (
+            "你是一名技术公众号编辑。审稿人已经读完了你的文章并给出了修改建议。\n"
+            "这次需要做较大幅度的修改，不要只改几个词：\n"
+            "- 如果审稿人说开头不够抓人，就重写开头，用具体的事实或矛盾切入\n"
+            "- 如果审稿人说观点太弱，就加入自己的明确判断（但判断要克制有分寸）\n"
+            "- 如果审稿人说结构模板化，就重新组织段落顺序和二级标题\n"
+            "- 如果审稿人说技术深度不够，就补充原文中的具体技术细节\n"
+            "- 如果审稿人说语言像机翻，就重写成自然的中文表达\n"
+            "- 不要删除原文中有价值的事实信息\n"
+            "- 保持文章风格：技术博客 + 行业观察\n"
+        )
+    else:
+        system = (
+            "你是一名技术公众号编辑。审稿人已经读完了你的文章并给出了修改建议。\n"
+            "请根据审稿建议逐条修改文章，不要敷衍，不要只改几个词。\n"
+            "修改原则：\n"
+            "- 如果审稿人说开头不够抓人，就重写开头，用具体的事实或矛盾切入\n"
+            "- 如果审稿人说观点太弱，就加入自己的明确判断（但判断要克制有分寸）\n"
+            "- 如果审稿人说结构模板化，就重新组织段落顺序和二级标题\n"
+            "- 如果审稿人说技术深度不够，就补充原文中的具体技术细节\n"
+            "- 如果审稿人说语言像机翻，就重写成自然的中文表达\n"
+            "- 不要删除原文中有价值的事实信息\n"
+            "- 保持文章风格：技术博客 + 行业观察\n"
+        )
 
     user = f"""以下是审稿人对你文章的评价和修改建议，请据此修改文章。
+
+修改策略：{strategy.get('description', '根据审稿建议修改')}
 
 【文章类型】{article_type}
 【原标题】{title}
@@ -619,13 +778,13 @@ def revise_article_with_review_feedback(
 """
     response = llm_provider.chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0.5,
+        temperature=strategy.get("temperature", 0.5),
     )
     return polish_llm_article(response, article_type)
 
 
 def save_article_states(
-    deepread_path: Path,
+    report_path: Path,
     root: Path,
     article_states: list[dict],
     generated_count: int,
@@ -634,24 +793,24 @@ def save_article_states(
     """写入最终的文章状态文件（审稿循环完成后调用）。"""
     from src.common.utils import load_json, write_json
 
-    data = load_json(deepread_path)
+    data = load_json(report_path)
     states_dir = root / "states"
     states_dir.mkdir(parents=True, exist_ok=True)
     write_json(
         states_dir / f"{data['date']}.article_states.json",
         {
             "date": data["date"],
-            "source_deepread": str(deepread_path.relative_to(root)).replace("/", "\\"),
+            "source_report": str(report_path.relative_to(root)).replace("/", "\\"),
             "generation_summary": {
-                "total_selected": len(data.get("selected_items", [])),
+                "total_items": len(data.get("items", [])),
                 "generated": generated_count,
                 "github_count": github_count,
                 "non_github_count": generated_count - github_count,
             },
             "harness_layers": {
-                "context": "deepread 只保存当前文章需要的选择理由、写作计划和关键对象。",
+                "context": "writer 直接从 report JSON 读取 items，内嵌类型推断和路径生成。",
                 "tools": "抓取、评估、生成和验证由固定脚本执行。",
-                "orchestration": "pipeline.py 串联日报、deepread、文章生成、审稿修订和验证阶段。",
+                "orchestration": "pipeline.py 串联日报、文章生成、审稿修订和验证阶段（已去掉 deepread 中间层）。",
                 "memory_state": "单篇上下文保留到审稿 Agent 通过后才丢弃；不通过则带着审稿意见修改。",
                 "evaluation_observation": "每篇生成前用 AI 评估原文质量，不好就跳过；生成后用独立审稿 Agent 做五维度评分。",
                 "constraints_recovery": "失败阶段写入 errors/，长期规则需人工确认。",

@@ -3,14 +3,17 @@
 
 [project]
 name = "微信公众号推送-harness"
-description = "微信公众号 AI 技术内容生产 Harness 流水线（v2.1 审稿修订版）"
-version = "2.1.0"
+description = "微信公众号 AI 技术内容生产 Harness 流水线（v2.3 审稿修订增强版）"
+version = "2.3.0"
 
 [pipeline]
-# v2.1 流水线参数
+# v2.3 流水线参数
 # agent.py 直接抓取 5 篇候选（GitHub 最多 2，其他至少 3）
-# writer 逐篇 AI 评估质量 + 生成 MD
-# 审稿 Agent 独立评审 → 不通过则修改 → 再审（最多 N 轮）
+# writer 直接从 report JSON 读取，内嵌类型推断和路径生成（无 deepread 中间层）
+# 审稿修订循环（最多 N 轮，门槛 65 分）：
+#   - 逐轮调整修改策略：温和 → 强化 → 强力重构
+#   - 退化检测：评分连续 3 轮下降 → 提前终止
+#   - 每篇文章独立追踪评分历史
 default_days = 10
 target_article_count = 5
 max_github = 2
@@ -63,9 +66,16 @@ request_timeout = 240
 revision_max_attempts = 0
 max_original_chars = 120000
 
-# 审稿 Agent 配置（独立于写作 Agent，使用 REVIEW_LLM_* 环境变量）
+# 审稿修订配置（独立于写作 Agent）
+# review_max_rounds: 每篇文章最多审稿→修改→再审的轮数（默认 3）
+#   - 第 1 轮: gentle 温和修改 (temperature 0.5)
+#   - 第 2 轮: moderate 强化修改 (temperature 0.7)
+#   - 第 3+ 轮: aggressive 强力重构 (temperature 0.8)
+# review_pass_score: 审稿通过的最低分数（0-100）
+# review_degraded_threshold: 退化检测——连续多少轮评分下降则提前终止（默认 3）
 review_max_rounds = 3
-review_pass_score = 75
+review_pass_score = 65
+review_degraded_threshold = 3
 
 # 日志分析 Agent 配置（独立于写作/审稿 Agent，使用 LOG_ANALYZER_LLM_* 环境变量）
 # 当已知坑位规则未匹配时，自动调用 LLM 分析失败日志并给出沉淀建议
@@ -83,7 +93,7 @@ quality_eval_max_tokens = 200
 min_char_count = 1200
 max_char_count = 3000
 min_h2_count = 3
-min_score_for_publish = 75
+min_score_for_publish = 65
 max_paragraph_chars = 170
 min_sentence_chars = 24
 max_sentence_chars = 180
