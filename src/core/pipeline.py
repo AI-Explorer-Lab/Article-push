@@ -86,7 +86,8 @@ def load_agent_rules() -> str:
 
 
 def project_path(path: Path) -> str:
-    return str(path.relative_to(ROOT)).replace("/", "\\")
+    """返回相对于项目根目录的路径，使用系统原生分隔符。"""
+    return str(path.relative_to(ROOT))
 
 
 def run_stage(name: str, command: list[str], stream: bool = False, log: PipelineLogger | None = None) -> StageResult:
