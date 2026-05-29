@@ -71,29 +71,16 @@ FOCUS_TOPICS: dict[str, list[str]] = {
 }
 
 # 微信公众号来源（通过搜狗微信搜索）
-WECHAT_SOURCES: list[tuple[str, str]] = [
-    ("Challenge Hub", "AI Agent 技术"),
-    ("量子位", "AI 人工智能"),
-    ("AI学习的老章", "AI Agent"),
-]
-
-# 微信公众号 account id 映射（用于搜狗微信搜索精确匹配）
-WECHAT_ACCOUNT_IDS: dict[str, str] = {
-    "Challenge Hub": "",
-    "量子位": "QbitAI",
-    "AI学习的老章": "",
-}
-
-INSIGHTS = {
-    "AI Agent": "值得关注它是否把规划、工具调用、反馈评估做成闭环，而不是停留在聊天式能力展示。",
-    "Harness Engineering": "这类进展说明 AI 落地正在进入工程约束阶段，稳定性、成本和可观测性会决定真实价值。",
-    "Context Engineering": "上下文组织正在成为 Agent 质量上限，检索、记忆和权限边界需要作为同一套系统设计。",
-    "MCP": "MCP 相关动态会影响 Agent 能连接多少真实系统，是从演示走向生产的关键基础设施。",
-    "AI Coding": "Coding Agent 进入真实仓库后，权限、测试、审查和供应链安全需要和生成能力同步建设。",
-    "Vibe Coding": "Vibe Coding 的价值不只在生成速度，更在能否把需求、实现、验证串成可追踪流程。",
-    "LLM推理与优化": "推理优化正在从实验室走向工程实践，模型能力上限和实际可用性之间的鸿沟在缩小。",
-    "多模态大模型": "多模态能力扩展了 AI 的感知边界，但真正的挑战在于不同模态之间的对齐和可靠性。",
-}
+# 配置在 src/constants/wechat_sources.py 中，此处从常量模块导入
+from src.constants.wechat_sources import WECHAT_SOURCES, WECHAT_ACCOUNT_IDS
+from src.constants.info_sources import (
+    INSIGHTS,
+    get_web_sources,
+    get_wp_api_sources,
+    build_github_url,
+    get_source_bucket,
+    get_insight,
+)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -446,74 +433,78 @@ def fetch_sogou_wechat_legacy(account_name: str, query: str, logs: list[FetchLog
     return candidates
 
 
-def fetch_qbitai_posts(days: int, logs: list[FetchLog], limit: int = 6) -> list[Candidate]:
-    """QbitAI 有公开 WordPress JSON，可作为量子位的稳定替代源。"""
-    url = "https://www.qbitai.com/wp-json/wp/v2/posts?per_page=30&orderby=date&order=desc"
+def fetch_wp_api_sources(days: int, logs: list[FetchLog]) -> list[Candidate]:
+    """从 WordPress API 源抓取文章（如 QbitAI 等）。"""
     candidates: list[Candidate] = []
-    try:
-        response = fetch_text(url, timeout=20)
-        posts = json.loads(response)
-    except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
-        logs.append(FetchLog(source="QbitAI WordPress", url=url, ok=False, detail=str(exc)))
-        return candidates
-
-    cutoff = datetime.now() - timedelta(days=days)
-    for post in posts:
-        published_raw = str(post.get("date", ""))
-        published_at = published_raw[:10]
+    for wp_source in get_wp_api_sources():
+        wp_name = wp_source["name"]
+        wp_url = wp_source["url"]
+        wp_display = wp_source.get("display_name", wp_name)
+        wp_limit = wp_source.get("limit", 6)
         try:
-            published_dt = datetime.fromisoformat(published_raw.replace("Z", "+00:00"))
-        except ValueError:
-            published_dt = None
-        if published_dt and published_dt < cutoff:
+            response = fetch_text(wp_url, timeout=20)
+            posts = json.loads(response)
+        except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            logs.append(FetchLog(source=wp_name, url=wp_url, ok=False, detail=str(exc)))
             continue
 
-        title = clean_text(post.get("title", {}).get("rendered", ""))
-        excerpt = clean_text(post.get("excerpt", {}).get("rendered", ""))
-        link = post.get("link", "")
-        if not title or not link:
-            continue
+        cutoff = datetime.now() - timedelta(days=days)
+        for post in posts:
+            published_raw = str(post.get("date", ""))
+            published_at = published_raw[:10]
+            try:
+                published_dt = datetime.fromisoformat(published_raw.replace("Z", "+00:00"))
+            except ValueError:
+                published_dt = None
+            if published_dt and published_dt < cutoff:
+                continue
 
-        candidates.append(
-            Candidate(
-                title=title[:80],
-                source="量子位 / QbitAI",
-                url=link,
-                published_at=published_at,
-                snippet=excerpt[:200],
-                body=clean_text(post.get("content", {}).get("rendered", ""))[:4000],
+            title = clean_text(post.get("title", {}).get("rendered", ""))
+            excerpt = clean_text(post.get("excerpt", {}).get("rendered", ""))
+            link = post.get("link", "")
+            if not title or not link:
+                continue
+
+            candidates.append(
+                Candidate(
+                    title=title[:80],
+                    source=wp_display,
+                    url=link,
+                    published_at=published_at,
+                    snippet=excerpt[:200],
+                    body=clean_text(post.get("content", {}).get("rendered", ""))[:4000],
+                )
             )
-        )
-        if len(candidates) >= limit:
-            break
+            if len(candidates) >= wp_limit:
+                break
 
-    logs.append(FetchLog(source="QbitAI WordPress", url=url, ok=True, detail=f"found {len(candidates)} posts"))
+        logs.append(FetchLog(source=wp_name, url=wp_url, ok=True, detail=f"found {len(candidates)} posts"))
     return candidates
 
 
 def fetch_github(days: int, logs: list[FetchLog]) -> list[Candidate]:
     """从 GitHub 搜索 AI 相关热门仓库。"""
+    from src.constants.info_sources import GITHUB_SOURCE_NAME
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    query = quote(f"AI agent context MCP created:>{since}")
-    url = f"https://api.github.com/search/repositories?q={query}&sort=stars&order=desc&per_page=10"
+    url = build_github_url(since)
     candidates: list[Candidate] = []
     try:
         response = fetch_text(url, timeout=20)
         data = json.loads(response)
     except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
-        logs.append(FetchLog(source="GitHub", url=url, ok=False, detail=str(exc)))
+        logs.append(FetchLog(source=GITHUB_SOURCE_NAME, url=url, ok=False, detail=str(exc)))
         return candidates
     for repo in data.get("items", [])[:MAX_GITHUB]:
         candidates.append(
             Candidate(
                 title=repo.get("full_name", ""),
-                source="GitHub",
+                source=GITHUB_SOURCE_NAME,
                 url=repo.get("html_url", ""),
                 published_at=repo.get("created_at", "")[:10],
                 snippet=repo.get("description", "") or "",
             )
         )
-    logs.append(FetchLog(source="GitHub", url=url, ok=True, detail=f"found {len(candidates)} repos"))
+    logs.append(FetchLog(source=GITHUB_SOURCE_NAME, url=url, ok=True, detail=f"found {len(candidates)} repos"))
     return candidates
 
 
@@ -713,14 +704,12 @@ def collect_candidates(days: int, logs: list[FetchLog]) -> list[Candidate]:
     """收集所有候选文章。
 
     抓取策略：
-    - 微信公众号 3 个来源（通过搜索引擎搜索 mp.weixin.qq.com）
+    - 微信公众号（通过搜索引擎搜索 mp.weixin.qq.com）
       注意：搜狗微信搜索已改为 JS 动态加载，纯 HTTP 抓取可能获取不到结果。
       此时系统会从其他来源补足。
     - GitHub 最多 2 篇
-    - 机器之心
-    - OpenAI Blog
-    - Google DeepMind Blog
-    - 知乎 AI 话题（补充来源）
+    - 网页信息源（配置在 src/constants/info_sources.py）
+    - WordPress API 源（配置在 src/constants/info_sources.py）
     """
     all_candidates: list[Candidate] = []
 
@@ -734,26 +723,14 @@ def collect_candidates(days: int, logs: list[FetchLog]) -> list[Candidate]:
     github_candidates = fetch_github(days, logs)
     all_candidates.extend(github_candidates[:MAX_GITHUB])
 
-    # 3. 机器之心
-    all_candidates.extend(
-        fetch_blog_links("机器之心", "https://www.jiqizhixin.com/articles", "jiqizhixin", logs, limit=5)
-    )
-
-    # 4. OpenAI Blog
-    all_candidates.extend(
-        fetch_blog_links("OpenAI Blog", "https://openai.com/blog/", "openai", logs, limit=5)
-    )
-
-    # 5. Google DeepMind Blog
-    all_candidates.extend(
-        fetch_blog_links("Google DeepMind Blog", "https://deepmind.google/discover/blog/", "deepmind", logs, limit=5)
-    )
-
-    # 6. 如果还不够，尝试从知乎 AI 话题补充
-    if len(all_candidates) < TARGET_ARTICLES + 3:
+    # 3. 网页信息源（从常量配置读取）
+    for source_name, source_url, url_pattern in get_web_sources():
         all_candidates.extend(
-            fetch_blog_links("知乎", "https://www.zhihu.com/topic/19550901/hot", "zhihu", logs, limit=3)
+            fetch_blog_links(source_name, source_url, url_pattern, logs, limit=5)
         )
+
+    # 4. WordPress API 源
+    all_candidates.extend(fetch_wp_api_sources(days, logs))
 
     return all_candidates
 
@@ -852,11 +829,15 @@ def _generate_ai_summary_and_insight(candidate: Candidate, category: str) -> tup
                 elif line.upper().startswith("INSIGHT") and not insight:
                     insight = line.split(":", 1)[-1].strip()
 
-        # 最终 fallback
+        # 最终 fallback：LLM 已返回内容但标签解析失败，
+        # 用原始响应的前 200 字符作为 insight，保留 LLM 的判断
+        # 而不是回退到死板的 INSIGHTS 模板
         if not summary:
             summary = (candidate.snippet or candidate.body)[:100]
         if not insight:
-            insight = INSIGHTS.get(category, INSIGHTS["AI Agent"])[:150]
+            # 优先用 LLM 原始响应（去掉 SUMMARY: 前缀），它至少有自己的判断
+            raw_insight = re.sub(r"^\s*SUMMARY:\s*", "", response).strip()
+            insight = raw_insight[:200] if raw_insight else (candidate.snippet or candidate.body)[:100]
 
         return summary[:200], insight[:200]
 
@@ -866,12 +847,8 @@ def _generate_ai_summary_and_insight(candidate: Candidate, category: str) -> tup
 
 
 def source_bucket(source: str) -> str:
-    """判断来源类型。"""
-    if "微信公众号" in source:
-        return "微信公众号"
-    if "GitHub" in source:
-        return "GitHub"
-    return "其他"
+    """判断来源类型（委托给常量模块）。"""
+    return get_source_bucket(source)
 
 
 # ---------------------------------------------------------------------------
@@ -880,13 +857,14 @@ def source_bucket(source: str) -> str:
 
 def infer_article_type(item: dict) -> str:
     """根据条目信息推断文章类型。"""
+    from src.constants.info_sources import GITHUB_TYPE_KEYWORDS, TOOL_TYPE_KEYWORDS
     source = str(item.get("source", ""))
     title = str(item.get("title", ""))
     url = str(item.get("url", ""))
     text = f"{source} {title} {url}".lower()
-    if "github.com" in text or "github" in source.lower():
+    if any(kw in text for kw in GITHUB_TYPE_KEYWORDS):
         return "工具型"
-    if any(word in text for word in ["sdk", "api", "mcp", "context", "harness", "openai"]):
+    if any(word in text for word in TOOL_TYPE_KEYWORDS):
         return "解读型"
     return "主线型"
 
@@ -982,7 +960,12 @@ def build_llm_writer_prompt(item: dict, original_text: str) -> list[dict]:
         "2. 每个二级标题下必须有原文中的具体信息，不要写成空泛的「XX的意义」\n"
         "3. 段落要自然——事实→解释→判断，不要用「首先其次最后」串段落\n"
         "4. 语言像技术博客，不像新闻稿也不像论文摘要\n"
-        "5. 只写原文里有的内容，不要脑补，信息不足就降低判断强度\n"
+        "5. 只写原文里有的内容，不要脑补，信息不足就降低判断强度\n\n"
+        "避免以下表达（它们是常见模板腔，会让文章显得像 AI 生成的）：\n"
+        "- 「真正值得看的不是」「真正值得看的，不是」「真正值得」「真正考验」\n"
+        "- 「背后的技术信号」「这条动态值得拆开看」\n"
+        "- 「在当今时代」「随着AI的快速发展」「众所周知」「综上所述」「总而言之」\n"
+        "- 任何「不是…而是…」的对比句式作为开场\n"
     )
 
     type_hint = ""
@@ -1015,20 +998,7 @@ def build_llm_writer_prompt(item: dict, original_text: str) -> list[dict]:
 
 
 def polish_llm_article(content: str) -> str:
-    """对 LLM 生成的文章进行轻量润色。"""
-    replacements = {
-        "真正值得看的不是": "需要关注的不是",
-        "真正值得看的，不是": "需要关注的，不是",
-        "背后的技术信号": "其中的技术信号",
-        "这条动态值得拆开看": "这条动态适合按工程链路拆开看",
-        "在当今时代，": "",
-        "随着AI的快速发展，": "",
-        "众所周知，": "",
-        "综上所述，": "",
-        "总而言之，": "",
-    }
-    for old, new in replacements.items():
-        content = content.replace(old, new)
+    """对 LLM 生成的文章进行轻量润色（仅做段落拆分，不再硬编码模板替换）。"""
     return wrap_long_paragraphs(content)
 
 

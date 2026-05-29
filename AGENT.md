@@ -21,12 +21,10 @@
 
 ## 信息源
 优先搜索以下来源：
-- 微信公众号（通过搜狗微信搜索）：Challenge Hub、量子位、AI学习的老章
+- 微信公众号（通过搜狗微信搜索）：配置在 `src/constants/wechat_sources.py` 中
 - GitHub Trending/Search：AI 相关热门仓库（最多 2 篇）
-- 机器之心
-- 官方博客：OpenAI Blog、Google DeepMind Blog
-
-不再抓取 Anthropic News。
+- 网页信息源：配置在 `src/constants/info_sources.py` 中
+- WordPress API 源：配置在 `src/constants/info_sources.py` 中
 
 ## 关注领域
 条目必须匹配至少一个领域：
@@ -49,7 +47,7 @@
   "items": [
     {
       "title": "中文标题",
-      "source": "微信公众号 | GitHub | 机器之心 | OpenAI Blog | Google DeepMind",
+      "source": "微信公众号 | GitHub | 网页信息源（见 info_sources.py 配置）",
       "url": "https://...",
       "date": "YYYY-MM-DD",
       "category": "关注领域之一",

@@ -20,40 +20,16 @@ from dotenv import load_dotenv
 
 from src.common.verifier import VerifierResult
 from src.common.utils import chinese_char_count
+from src.constants.wechat_sources import build_forbidden_patterns
 
 load_dotenv()
 
 
 VALID_ARTICLE_TYPES = {"主线型", "解读型", "工具型"}
-PROHIBITED_PATTERNS = [
-    ("参考来源", r"参考来源"),
-    ("参考资料", r"参考资料"),
-    ("参考链接", r"参考链接"),
-    ("来源归因", r"来源[:：]"),
-    ("据某方报道", r"据.{0,12}报道"),
-    ("量子位", r"量子位"),
-    ("机器之心", r"机器之心"),
-    ("公众号名", r"Challenge Hub|AI学习的老章"),
-]
+# 禁止词列表从公众号配置自动生成，避免硬编码具体名称
+PROHIBITED_PATTERNS = build_forbidden_patterns()
 
-OVERUSED_TEMPLATE_PATTERNS = [
-    r"真正值得看的，不是标题里那一点热闹",
-    r"这条 AI 动态，真正值得看的是工程入口",
-    r"真正考验的是落地边界",
-    r"AI 进入真实研发流程的问题摆到了台前",
-    r"真正值得",
-    r"真正考验",
-    r"真正.*不是.*而是",
-    r"这条动态值得拆开看",
-    r"背后的技术信号",
-    r"不只要看功能",
-    r"不能只看功能",
-    r"这件事到底改变了什么",
-    r"先看它到底是什么",
-    r"这不是孤立更新",
-    r"最后落回一个简单问题",
-    r"放回日常工作里",
-]
+
 
 
 def load_deepread(path: Path | None) -> dict[str, dict]:
@@ -152,7 +128,14 @@ def review_with_agent(
         "二级标题是不是有具体信息而不是空泛概括、有没有模板腔和套话\n"
         "- 评分要公正客观，不要因为文章格式规整就自动压低分数\n"
         "- 如果文章内容准确、逻辑清晰、有具体信息，即使文风略显规整也应该给合理分数\n"
-        "- 只有明显的模板腔、空洞套话、缺少实质内容时才需要扣分\n"
+        "- 只有明显的模板腔、空洞套话、缺少实质内容时才需要扣分\n\n"
+        "模板腔参考（以下表达如出现多处，说明文章过于模板化，应降低 storyline 和 point_of_view 评分）：\n"
+        "- 「真正值得看的，不是标题里那一点热闹」「这条 AI 动态，真正值得看的是工程入口」\n"
+        "- 「真正考验的是落地边界」「AI 进入真实研发流程的问题摆到了台前」\n"
+        "- 「这条动态值得拆开看」「背后的技术信号」「这件事到底改变了什么」\n"
+        "- 「不只要看功能」「不能只看功能」「这不是孤立更新」\n"
+        "- 「最后落回一个简单问题」「放回日常工作里」\n"
+        "- 任何「真正…不是…而是…」的对比句式反复出现\n"
     )
 
     user = f"""请审读下面这篇技术公众号文章，给出评分和修改建议。
@@ -338,10 +321,6 @@ def verify_article(
     for label, pattern in PROHIBITED_PATTERNS:
         if re.search(pattern, text):
             errors.append(f"最终 Markdown 出现禁止内容: {label}")
-
-    for pattern in OVERUSED_TEMPLATE_PATTERNS:
-        if re.search(pattern, text):
-            errors.append(f"最终 Markdown 出现旧模板化表达: {pattern}")
 
     if deepread_item:
         source_url = str(deepread_item.get("url", ""))

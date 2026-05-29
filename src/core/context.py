@@ -12,6 +12,7 @@ import re
 from urllib.error import HTTPError, URLError
 
 from src.common.utils import chinese_char_count, clean_text, fetch_text
+from src.constants.wechat_sources import build_context_noise_patterns
 
 
 def extract_required_terms(text: str, url: str = "") -> list[str]:
@@ -79,11 +80,7 @@ def score_sentence(sentence: str, terms: list[str], article_type: str) -> int:
 
 def is_usable_fact_sentence(sentence: str) -> bool:
     """判断句子是否是可用的事实句子（排除噪声）。"""
-    noise_patterns = [
-        "来源：", "量子位", "机器之心", "扫码", "相关阅读",
-        "参考链接", "热门文章", "版权所有", "ICP备",
-        "关于我们", "加入我们", "商务合作", "首页",
-    ]
+    noise_patterns = build_context_noise_patterns()
     if any(pattern in sentence for pattern in noise_patterns):
         return False
     if len(re.findall(r"\d{4}-\d{2}-\d{2}", sentence)) >= 2:

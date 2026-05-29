@@ -72,6 +72,12 @@ src/
 │   ├── utils.py                    # 抓取、清洗、JSON 读写等工具函数
 │   └── verifier.py                 # 统一验证器数据类 (VerifierResult)
 │
+├── constants/                      # 用户常量配置（按需修改，保护隐私）
+│   ├── wechat_sources.py           # 微信公众号搜索源（不暴露个人信息）
+│   ├── info_sources.py             # 网页源/模板/洞察等通用配置（不暴露数据源）
+│   ├── wechat_sources.py.bk        # 个人备份（.gitignore 已排除）
+│   └── info_sources.py.bk          # 个人备份（.gitignore 已排除）
+│
 ├── infrastructure/                 # 基础设施 — ② 工具系统
 │   ├── llm_client.py               # LLM API 调用封装（写作/审稿/日志分析）
 │   ├── browser_fetcher.py          # Selenium 浏览器抓取（搜狗微信搜索）
@@ -225,6 +231,47 @@ python -m src.validators.verify_article daily_paper/2026-05-29-01.md --verbose
 ---
 
 ## 配置说明
+
+### 微信公众号搜索源配置
+
+编辑 `src/constants/wechat_sources.py`，填入你要追踪的公众号：
+
+```python
+WECHAT_SOURCES: list[tuple[str, str]] = [
+    ("你的公众号名称", "搜索关键词"),
+]
+
+WECHAT_ACCOUNT_IDS: dict[str, str] = {
+    "你的公众号名称": "",  # Account ID 可选，不知道就留空
+}
+```
+
+### 网页信息源与模板配置
+
+编辑 `src/constants/info_sources.py`，配置网页抓取源、模板模式等：
+
+```python
+# 网页信息源（名称, URL, 匹配pattern）
+WEB_SOURCES: list[tuple[str, str, str]] = [
+    ("示例技术博客", "https://example.com/articles", "example"),
+]
+
+# WordPress API 源（有公开 JSON API 的站点）
+WP_API_SOURCES: list[dict] = [
+    # {"name": "...", "url": "...", "display_name": "...", "limit": 6},
+]
+```
+
+**隐私保护**：禁止词和正文噪声清洗规则会自动从你的配置生成，无需手动维护。
+如需备份自己的真实配置，复制到 `*.py.bk`（已被 `.gitignore` 排除，不会提交到 Git）。
+
+### 禁止词规则说明
+
+禁止词检查区分两种场景：
+- **搬运腔**：拦截 `据{来源名}报道`、`{来源名}称`、`援引{来源名}` 等搬运原文的表述
+- **正常提及**：放行 `{来源名}举办了xxx`、`{来源名}发布了xxx` 等正常的新闻叙述
+
+### 流水线与文章配置
 
 核心配置在 `harness.toml`（① 上下文精细化 - Config as Code）：
 
