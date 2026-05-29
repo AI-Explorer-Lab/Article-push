@@ -2,6 +2,7 @@
 
 python-dotenv>=1.0.0
 selenium>=4.0.0
+webdriver-manager>=4.0.0
 
 # 可选依赖（仅在需要解析 harness.toml 一致性校验时使用）
 # tomli>=2.0.0; python_version < "3.11"
