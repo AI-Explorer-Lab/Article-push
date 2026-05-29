@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -446,6 +447,8 @@ def fetch_wechat_source_full(
     driver = None
 
     try:
+        print(f"[browser_fetcher] 启动 Chrome 浏览器（headless={headless}）...")
+        sys.stdout.flush()
         options = _create_chrome_options(headless=headless)
         # 优先使用 Selenium 4.x 内置的 Selenium Manager 自动管理 ChromeDriver，
         # 如果失败则尝试 webdriver_manager 作为回退
@@ -459,6 +462,8 @@ def fetch_wechat_source_full(
                 driver = webdriver.Chrome(service=service, options=options)
             except ImportError:
                 raise
+        print(f"[browser_fetcher] Chrome 启动成功")
+        sys.stdout.flush()
         driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
         driver.implicitly_wait(IMPLICIT_WAIT)
         driver.execute_script(
@@ -480,9 +485,14 @@ def fetch_wechat_source_full(
         # 因此改为直接用 URL 方式搜索，时间筛选在后续代码层通过日期过滤完成。
         search_query = f"{account_name} {query}".strip()
 
+        print(f"[browser_fetcher] 搜索: {search_query[:40]}")
+        sys.stdout.flush()
+
         # 方案 A: 直接 URL 搜索（type=2 表示搜索文章）
         search_url = f"https://weixin.sogou.com/weixin?type=2&query={search_query}"
         try:
+            print(f"[browser_fetcher] 访问搜狗搜索页面...")
+            sys.stdout.flush()
             driver.get(search_url)
             time.sleep(5)  # 等待 JS 渲染搜索结果
 
@@ -616,6 +626,8 @@ def fetch_wechat_source_full(
         )
 
         # 阶段 B: 逐篇抓取正文
+        print(f"[browser_fetcher] 阶段B: 逐篇抓取正文 (最多 {max_articles} 篇)...")
+        sys.stdout.flush()
         for meta in candidate_metas:
             if len(articles) >= max_articles:
                 break
@@ -645,6 +657,8 @@ def fetch_wechat_source_full(
                 "snippet": meta["snippet"],
                 "body": body,
             })
+            print(f"  [browser_fetcher]   ✓ {meta['title'][:40]} ({len(body)} 字符)")
+            sys.stdout.flush()
 
     except Exception as exc:
         print(f"[browser_fetcher] Error during wechat fetch: {exc}")

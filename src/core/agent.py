@@ -192,6 +192,8 @@ def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog], days
     # 策略 1: Selenium 浏览器抓取（推荐）
     try:
         from src.infrastructure.browser_fetcher import fetch_wechat_source_full
+        print(f"    启动 Selenium 浏览器抓取...")
+        sys.stdout.flush()
         articles = fetch_wechat_source_full(
             account_name=account_name,
             query=query,
@@ -199,6 +201,7 @@ def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog], days
             headless=True,
             days=days,
         )
+        print(f"    Selenium 返回 {len(articles)} 篇")
         for article in articles:
             published_at = article.get("published_at", "")
             # 日期过滤：只保留 days 天内的文章
@@ -594,10 +597,13 @@ def enrich_candidate(candidate: Candidate) -> None:
             from src.infrastructure.browser_fetcher import (
                 create_browser, fetch_wechat_article,
             )
+            print(f"    启动浏览器抓取微信文章...")
+            sys.stdout.flush()
             with create_browser(headless=True) as driver:
                 body = fetch_wechat_article(driver, url)
                 if body and len(body) >= 300:
                     candidate.body = body
+                    print(f"    微信文章抓取成功 ({len(body)} 字符)")
                     return
         except Exception as exc:
             print(f"  [WARN] Selenium 抓取微信文章失败: {exc}")
@@ -716,22 +722,36 @@ def collect_candidates(days: int, logs: list[FetchLog]) -> list[Candidate]:
     all_candidates: list[Candidate] = []
 
     # 1. 微信公众号（通过 Selenium 浏览器抓取搜狗微信搜索，失败时回退 urllib）
-    for account_name, query in WECHAT_SOURCES:
+    wechat_count = len(WECHAT_SOURCES)
+    for i, (account_name, query) in enumerate(WECHAT_SOURCES, 1):
+        print(f"[FETCH] [{i}/{wechat_count}] 抓取微信公众号: {account_name}...")
+        sys.stdout.flush()
         wechat_candidates = fetch_sogou_wechat(account_name, query, logs, days=days)
         all_candidates.extend(wechat_candidates)
+        print(f"[FETCH]   → {account_name}: {len(wechat_candidates)} 篇")
+        sys.stdout.flush()
         time.sleep(1)
 
     # 2. GitHub（最多 2 篇）
+    print(f"[FETCH] 抓取 GitHub Trending...")
+    sys.stdout.flush()
     github_candidates = fetch_github(days, logs)
     all_candidates.extend(github_candidates[:MAX_GITHUB])
+    print(f"[FETCH]   → GitHub: {len(github_candidates[:MAX_GITHUB])} 篇")
+    sys.stdout.flush()
 
     # 3. 网页信息源（从常量配置读取）
-    for source_name, source_url, url_pattern in get_web_sources():
+    web_sources = list(get_web_sources())
+    for i, (source_name, source_url, url_pattern) in enumerate(web_sources, 1):
+        print(f"[FETCH] [{i}/{len(web_sources)}] 抓取网页源: {source_name}...")
+        sys.stdout.flush()
         all_candidates.extend(
             fetch_blog_links(source_name, source_url, url_pattern, logs, limit=5)
         )
 
     # 4. WordPress API 源
+    print(f"[FETCH] 抓取 WordPress API 源...")
+    sys.stdout.flush()
     all_candidates.extend(fetch_wp_api_sources(days, logs))
 
     return all_candidates
@@ -1267,6 +1287,7 @@ def process_one_candidate(
 
     # ---- Step 1: 抓取原文 ----
     print(f"\n{idx_label} 📥 抓取原文: {candidate.title[:60]}...")
+    sys.stdout.flush()
     enrich_candidate(candidate)
     original_text = candidate.body or candidate.snippet or ""
 
@@ -1278,6 +1299,7 @@ def process_one_candidate(
 
     # ---- Step 2: AI 阅读原文 → summary + insight + 分类 ----
     print(f"  [READ] AI 阅读原文中...")
+    sys.stdout.flush()
     category = classify(candidate)
     summary, insight = _generate_ai_summary_and_insight(candidate, category)
     print(f"  [分类] {category}")
@@ -1286,6 +1308,7 @@ def process_one_candidate(
     # ---- Step 3: AI 质量评估 ----
     if llm_provider:
         print(f"  [EVAL] AI 评估质量中...")
+        sys.stdout.flush()
         passed, reason = evaluate_quality_with_ai(candidate, llm_provider)
         print(f"  [{'PASS' if passed else 'SKIP'}] {reason[:100]}")
         if not passed:
@@ -1310,6 +1333,7 @@ def process_one_candidate(
 
     # ---- Step 5: LLM 写作 ----
     print(f"  [WRITE] LLM 生成文章中...")
+    sys.stdout.flush()
     try:
         article_text = llm_provider.chat(
             build_llm_writer_prompt(item, original_text),
@@ -1330,6 +1354,7 @@ def process_one_candidate(
     if reviewer:
         for round_num in range(1, max_review_rounds + 1):
             print(f"  [REVIEW] 第 {round_num}/{max_review_rounds} 轮审稿...")
+            sys.stdout.flush()
             result = review_article(
                 article_text=article_text,
                 article_type=article_type,
@@ -1380,6 +1405,7 @@ def process_one_candidate(
 
             # 修改文章
             print(f"  🔄 根据审稿建议修改中...")
+            sys.stdout.flush()
             try:
                 article_text = revise_article_with_feedback(
                     article_text=article_text,
@@ -1485,8 +1511,11 @@ def run_full_pipeline(report_date: str, days: int) -> dict:
     from src.infrastructure.llm_client import create_llm_provider
 
     try:
+        print(f"\n[LLM] 初始化 LLM Provider...")
+        sys.stdout.flush()
         writer_llm = create_llm_provider()
-        print(f"\n[LLM] 写作模型: {writer_llm.model}")
+        print(f"[LLM] 写作模型: {writer_llm.model}")
+        sys.stdout.flush()
     except Exception as exc:
         print(f"\n[ERROR] 无法创建写作 LLM provider: {exc}")
         raise SystemExit(1)
