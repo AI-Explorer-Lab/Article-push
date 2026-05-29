@@ -1,4 +1,3 @@
-# 微信公众号推送-harness 依赖清单
 # 安装: pip install -r requirements.txt
 
 python-dotenv>=1.0.0
