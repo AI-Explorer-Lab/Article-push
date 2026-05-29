@@ -19,12 +19,10 @@ from typing import Generator
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -449,8 +447,18 @@ def fetch_wechat_source_full(
 
     try:
         options = _create_chrome_options(headless=headless)
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
+        # 优先使用 Selenium 4.x 内置的 Selenium Manager 自动管理 ChromeDriver，
+        # 如果失败则尝试 webdriver_manager 作为回退
+        try:
+            driver = webdriver.Chrome(options=options)
+        except Exception:
+            try:
+                from webdriver_manager.chrome import ChromeDriverManager
+                from selenium.webdriver.chrome.service import Service as ChromeService
+                service = ChromeService(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=options)
+            except ImportError:
+                raise
         driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
         driver.implicitly_wait(IMPLICIT_WAIT)
         driver.execute_script(
