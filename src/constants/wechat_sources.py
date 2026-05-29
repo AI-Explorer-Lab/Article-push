@@ -26,7 +26,6 @@ WECHAT_SOURCES: list[tuple[str, str]] = [
     ("ChallengeHub", ""),
     ("量子位", ""),
     ("Ai学习的老章", ""),
-    ("机器学习算法与Python实战", ""),
 ]
 
 WECHAT_ACCOUNT_IDS: dict[str, str] = {
@@ -34,7 +33,6 @@ WECHAT_ACCOUNT_IDS: dict[str, str] = {
     "ChallengeHub": "",
     "量子位": "QbitAI",
     "Ai学习的老章": "",
-    "机器学习算法与Python实战": "",
 }
 
 # ============================================================
