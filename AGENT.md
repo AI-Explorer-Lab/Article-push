@@ -1,4 +1,4 @@
-# AGENT.md - 微信公众号推送 Harness 规则契约（v2.4 质量增强版）
+# AGENT.md - 微信公众号推送 Harness 规则契约（v3.0）
 
 ## 任务目标
 追踪前沿 AI 技术动态，生成可验证、可归档、可发布到公众号的文章。
@@ -16,7 +16,7 @@
 - **AI 评估质量**：获取链接元数据后，用 AI 阅读原文判断好不好，好的生成 MD，不好就跳过
 - **逐篇处理**：每读完一篇生成完，保留上下文记忆直到审稿 Agent 通过后才丢弃
 - **来源真实**：所有 URL 必须真实可访问
-- **无 deepread 中间层**：report JSON 直接驱动 writer，文章类型推断和路径生成内嵌在 writer 中
+- **全链路内聚**：agent.py 内聚抓取→阅读→写作→审稿→保存全部逻辑，无中间层
 - **审稿修订有明确边界**：每篇最多 N 轮修改，连续退化自动终止
 
 ## 信息源
@@ -68,10 +68,6 @@ URL 必须真实；`relevance` 为 1-5，低于 3 的内容不要收录。
 - 同一 URL 不要重复收录
 - 默认收录 5 条（GitHub 最多 2 条，微信公众号/媒体/博客至少 3 条）
 
-## 深度阅读中间文件规则（v2.2 已移除）
-v2.2 起不再生成 `reports/YYYY-MM-DD.deepread.json`。writer 直接从 report JSON 的 `items` 读取候选，
-内嵌完成文章类型推断（infer_article_type）、标题生成（article_title）和输出路径生成（unique_output_file）。
-
 ## 审稿修订循环规则（v2.3 新增）
 每篇文章的审稿→修改→再审流程：
 
@@ -103,7 +99,6 @@ v2.2 起不再生成 `reports/YYYY-MM-DD.deepread.json`。writer 直接从 repor
 - 不同文章之间不能复用上一篇的事实、表达套路或判断框架
 
 LLM 写作层规则：
-- 启用 `pipeline.py --use-llm-writer` 时，先用 AI 评估质量，再生成文章
 - LLM 必须基于当前条目的原文全文写作
 - 原文全文只允许存在于单篇文章生成函数的局部上下文中
 - 审稿 Agent（REVIEW_LLM_*）与写作 LLM 使用独立的 provider 实例，避免 bias
@@ -124,20 +119,19 @@ LLM 写作层规则：
 
 ## Pipeline 入口
 ```bash
-python -m src.core.pipeline --date YYYY-MM-DD [--use-llm-writer]
+python -m src.core.pipeline --date YYYY-MM-DD
 ```
 
 流程：
 ```
 读取 AGENT.md
 -> agent.py 直接抓取 5 篇候选（GitHub 最多 2，其他至少 3）
--> verify.py 验证基础日报
--> writer 直接从 report JSON 逐篇 AI 评估 + 生成 MD（好的写，不好跳过）
--> 审稿修订循环（最多 N 轮，逐轮策略升级，退化检测）:
+-> 逐篇：抓原文 → AI 阅读 → 质量评估 → 写作 → 审稿修订循环:
     审稿 Agent 独立评审 → 不通过则修改 → 再审
     - gentle (R1) → moderate (R2) → aggressive (R3+)
     - 连续 3 轮评分下降 → 提前终止
 -> 审稿通过后丢弃上下文记忆
+-> verify.py 验证基础日报
 -> verify_article.py 逐篇验证
 ```
 
