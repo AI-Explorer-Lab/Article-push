@@ -1615,7 +1615,7 @@ def run_full_pipeline(report_date: str, days: int) -> dict:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate the AI tech daily report (per-article pipeline).")
     parser.add_argument("--date", default=date.today().isoformat(), help="Report date in YYYY-MM-DD.")
-    parser.add_argument("--days", type=int, default=10, help="Lookback window in days.")
+    parser.add_argument("--days", type=int, default=1, help="Lookback window in days (default 1 = today only).")
     parser.add_argument("--output", default=None, help="Custom output path for report JSON.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing articles.")
     return parser.parse_args()

@@ -467,6 +467,14 @@ def fetch_wechat_source_full(
             search_btn = driver.find_element(By.CSS_SELECTOR, "input[type='submit']")
             search_btn.click()
             time.sleep(4)
+            # 尝试点击"按时间排序"让最新文章排前面
+            try:
+                sort_by_time = driver.find_element(By.XPATH, "//a[contains(text(), '时间') or contains(text(), '时间排序')]")
+                sort_by_time.click()
+                time.sleep(3)
+                print("[browser_fetcher] 已切换到按时间排序")
+            except Exception:
+                pass  # 某些情况下排序按钮不可用，忽略
             # 等待搜索结果出现
             try:
                 WebDriverWait(driver, 8).until(

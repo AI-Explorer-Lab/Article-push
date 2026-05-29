@@ -237,7 +237,7 @@ def update_article_states(report_path: Path, results: list[StageResult], article
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the full WeChat article harness pipeline (orchestration layer).")
     parser.add_argument("--date", default=date.today().isoformat(), help="Pipeline date in YYYY-MM-DD.")
-    parser.add_argument("--days", type=int, default=10, help="Lookback window for agent.py.")
+    parser.add_argument("--days", type=int, default=1, help="Lookback window for agent.py (default 1 = today only).")
     parser.add_argument("--skip-fetch", action="store_true", help="Use existing report JSON instead of running agent.py.")
     parser.add_argument("--overwrite", action="store_true", help="Force re-run agent even if articles exist.")
     return parser.parse_args()
