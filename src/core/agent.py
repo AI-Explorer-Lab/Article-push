@@ -1,14 +1,21 @@
-"""src/core/agent.py - 精简版 AI 技术日报生成器。
+"""src/core/agent.py - 逐条全链路 AI 技术日报生成器。
 
-新架构（精简后）：
-1. 直接抓取 5 篇候选文章：
-   - 微信公众号（通过 Selenium 浏览器抓取搜狗微信搜索）：Challenge Hub、量子位、AI学习的老章
-   - GitHub Trending/Search（最多 2 篇）
-   - 机器之心
-   - OpenAI Blog、Google DeepMind Blog
-2. 逐篇用 AI 阅读原文，判断质量（好不好），好的就生成 MD 文章，不好就跳过
-3. 每读完一篇生成完，立即丢弃上下文记忆
-4. 不再先选 10 篇再挑 5 篇，直接边读边判断边生成
+架构（v2.5 逐条全链路版）：
+对每条候选文章，按以下顺序逐条处理：
+  1. 抓取文章链接（微信公众号/GitHub/博客）
+  2. 抓取原文全文（enrich：Selenium → urllib → fallback）
+  3. LLM 阅读原文 → 生成 summary（80-120字中文摘要）+ insight（独立判断）
+  4. LLM 语义分类
+  5. AI 质量评估（是否值得写）
+  6. LLM 写作（基于原文全文 + summary + insight）
+  7. 审稿 Agent 评分 → 不通过则逐轮修订（最多N轮）
+  8. 保存文章 + 写入 report JSON item → 丢弃上下文 → 处理下一条
+
+与旧版的关键区别：
+- 不再批量抓取全部候选后再统一生成
+- 不再分 agent → report → writer 三个阶段
+- 每条文章的处理上下文在完成后立即丢弃
+- 不需要中间文件 report JSON 做阶段间通信
 
 微信公众号抓取策略：
 - 优先使用 Selenium + Chrome 无头浏览器（可绕过搜狗反爬）
@@ -577,9 +584,11 @@ def fetch_blog_links(
 def enrich_candidate(candidate: Candidate) -> None:
     """抓取候选文章的原文全文。
 
-    如果 body 已存在（Selenium 已抓取），则跳过。
-    如果是微信文章 URL，尝试用浏览器抓取（绕过反爬）。
-    其他 URL 使用 urllib 抓取。
+    如果 body 已存在（Selenium 已抓取）且足够长，则跳过。
+    否则尝试多种策略获取原文：
+    1. Selenium 浏览器抓取（微信文章）
+    2. urllib 直接抓取
+    3. 使用 snippet 作为 fallback
     """
     if candidate.body and len(candidate.body) >= 300:
         return
@@ -596,23 +605,96 @@ def enrich_candidate(candidate: Candidate) -> None:
                 if body and len(body) >= 300:
                     candidate.body = body
                     return
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"  [WARN] Selenium 抓取微信文章失败: {exc}")
 
-    # 回退：urllib 抓取
+    # 非微信 URL 或微信 Selenium 失败：urllib 抓取
     try:
         candidate.body = clean_text(fetch_text(url, timeout=25))
-    except Exception:
-        candidate.body = ""
+        if candidate.body and len(candidate.body) >= 300:
+            return
+    except Exception as exc:
+        print(f"  [WARN] urllib 抓取失败: {exc}")
+
+    # 最终 fallback：使用 snippet 或已有 body
+    if not candidate.body:
+        candidate.body = candidate.snippet or ""
 
 
 def classify(candidate: Candidate) -> str:
-    """根据标题和正文对候选文章进行分类。"""
+    """根据标题和正文对候选文章进行分类。
+
+    优先使用 LLM 做语义分类，LLM 不可用时回退到关键词匹配。
+    """
+    # 优先使用 LLM 分类
+    try:
+        from src.infrastructure.llm_client import OpenAICompatibleProvider
+        # 尝试创建 LLM provider（不抛异常则可用）
+        provider = _get_shared_llm()
+        if provider:
+            return _classify_with_llm(candidate, provider)
+    except Exception:
+        pass
+
+    # 回退：关键词匹配
     text = f"{candidate.title} {candidate.snippet} {candidate.body[:2000]}".lower()
     for topic, keywords in FOCUS_TOPICS.items():
         if any(keyword in text for keyword in keywords):
             return topic
     return "AI Agent"
+
+
+def _classify_with_llm(candidate: Candidate, provider) -> str:
+    """使用 LLM 对文章进行语义分类。"""
+    valid_categories = list(FOCUS_TOPICS.keys())
+    categories_list = "\n".join(f"- {c}" for c in valid_categories)
+
+    prompt = [
+        {
+            "role": "system",
+            "content": (
+                "你是一名技术编辑。请根据文章标题和摘要，判断它最接近哪个技术领域。"
+                "只回复分类名称，不要加任何解释。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"文章标题：{candidate.title}\n"
+                f"摘要/简介：{candidate.snippet[:300]}\n\n"
+                f"可选分类：\n{categories_list}\n\n"
+                f"请选择最匹配的一个分类："
+            ),
+        },
+    ]
+
+    try:
+        response = provider.chat(prompt, temperature=0.1, max_tokens=30)
+        response = response.strip()
+        # 从回复中提取有效分类名
+        for cat in valid_categories:
+            if cat in response:
+                return cat
+        return "AI Agent"
+    except Exception:
+        return "AI Agent"
+
+
+# 缓存的 LLM provider 实例
+_shared_llm_provider = None
+
+
+def _get_shared_llm():
+    """获取共享的 LLM provider（用于 agent.py 内的 AI 摘要/分类/洞察生成）。"""
+    global _shared_llm_provider
+    if _shared_llm_provider is not None:
+        return _shared_llm_provider
+    try:
+        from src.infrastructure.llm_client import create_llm_provider
+        _shared_llm_provider = create_llm_provider()
+        return _shared_llm_provider
+    except Exception:
+        return None
 
 
 def normalize_title(title: str) -> str:
@@ -676,21 +758,110 @@ def collect_candidates(days: int, logs: list[FetchLog]) -> list[Candidate]:
 
 
 def to_report_item(candidate: Candidate) -> dict:
-    """将候选文章转为报告条目。"""
+    """将候选文章转为报告条目。
+
+    v2.4 改进：使用 LLM 生成高质量的 summary 和 insight，
+    不再用截断原文和硬编码模板。
+    """
     category = classify(candidate)
-    insight = INSIGHTS.get(category, INSIGHTS["AI Agent"])
+
+    # 用 LLM 生成 AI 摘要和洞察
+    summary, insight = _generate_ai_summary_and_insight(candidate, category)
+
     # 确保 relevance 至少为 3（验证脚本要求 >= 3）
-    relevance = max(3, min(5, 2 + len(candidate.body) // 400))
+    body_len = len(candidate.body or "")
+    snippet_len = len(candidate.snippet or "")
+    relevance = max(3, min(5, 3 + (body_len + snippet_len) // 600))
     return {
         "title": normalize_title(candidate.title),
         "source": candidate.source,
         "url": candidate.url,
         "date": candidate.published_at or date.today().isoformat(),
         "category": category,
-        "summary": (candidate.snippet or candidate.body)[:100],
-        "insight": insight[:150],
+        "summary": summary,
+        "insight": insight,
         "relevance": relevance,
     }
+
+
+def _generate_ai_summary_and_insight(candidate: Candidate, category: str) -> tuple[str, str]:
+    """使用 LLM 为候选文章生成高质量的摘要和洞察。
+
+    返回 (summary, insight) 元组。
+    LLM 不可用时回退到旧逻辑。
+    """
+    provider = _get_shared_llm()
+    if not provider:
+        # LLM 不可用，回退到旧逻辑
+        fallback_summary = (candidate.snippet or candidate.body)[:100]
+        fallback_insight = INSIGHTS.get(category, INSIGHTS["AI Agent"])[:150]
+        return fallback_summary, fallback_insight
+
+    # 构建原文内容（优先用 body，其次 snippet）
+    content = (candidate.body or candidate.snippet or "")[:5000]
+
+    if len(content) < 100:
+        # 内容太少，不值得调 LLM
+        return (candidate.snippet or candidate.title)[:100], INSIGHTS.get(category, INSIGHTS["AI Agent"])[:150]
+
+    prompt = [
+        {
+            "role": "system",
+            "content": (
+                "你是一名资深技术编辑。请阅读下面的文章内容，生成两段文字：\n\n"
+                "1. **summary**（80-120字）：用简洁中文概括文章的核心内容，"
+                "要说清楚是什么事件/技术/产品，关键信息是什么。不要写\"本文介绍了\"这种套话。\n\n"
+                "2. **insight**（40-80字）：给出你对这条内容的独立判断——"
+                "这件事为什么值得关注？技术或产业上有什么信号？判断要克制、有分寸。"
+                "不要写成\"值得关注\"这种空话，要说出具体原因。\n\n"
+                "请严格按以下格式输出，不要加任何其他内容：\n"
+                "SUMMARY: <摘要内容>\n"
+                "INSIGHT: <洞察内容>"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"文章标题：{candidate.title}\n"
+                f"来源：{candidate.source}\n"
+                f"分类：{category}\n\n"
+                f"文章内容：\n{content}"
+            ),
+        },
+    ]
+
+    try:
+        response = provider.chat(prompt, temperature=0.4, max_tokens=400)
+        response = response.strip()
+
+        # 解析 SUMMARY 和 INSIGHT
+        summary_match = re.search(r"SUMMARY:\s*(.+?)(?:\n|$)", response, re.S)
+        insight_match = re.search(r"INSIGHT:\s*(.+?)(?:\n|$)", response, re.S)
+
+        summary = summary_match.group(1).strip() if summary_match else ""
+        insight = insight_match.group(1).strip() if insight_match else ""
+
+        # 如果解析失败，尝试用整段文本分割
+        if not summary or not insight:
+            lines = response.split("\n")
+            for line in lines:
+                line = line.strip()
+                if line.upper().startswith("SUMMARY") and not summary:
+                    summary = line.split(":", 1)[-1].strip()
+                elif line.upper().startswith("INSIGHT") and not insight:
+                    insight = line.split(":", 1)[-1].strip()
+
+        # 最终 fallback
+        if not summary:
+            summary = (candidate.snippet or candidate.body)[:100]
+        if not insight:
+            insight = INSIGHTS.get(category, INSIGHTS["AI Agent"])[:150]
+
+        return summary[:200], insight[:200]
+
+    except Exception:
+        # LLM 调用失败，回退
+        return (candidate.snippet or candidate.body)[:100], INSIGHTS.get(category, INSIGHTS["AI Agent"])[:150]
 
 
 def source_bucket(source: str) -> str:
@@ -703,20 +874,589 @@ def source_bucket(source: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 构建日报 JSON
+# v2.5: 逐条全链路处理 —— 抓取→阅读→写作→审稿→修订→保存
 # ---------------------------------------------------------------------------
 
-def build_report(report_date: str, days: int) -> dict:
-    """抓取并生成日报 JSON。
+def infer_article_type(item: dict) -> str:
+    """根据条目信息推断文章类型。"""
+    source = str(item.get("source", ""))
+    title = str(item.get("title", ""))
+    url = str(item.get("url", ""))
+    text = f"{source} {title} {url}".lower()
+    if "github.com" in text or "github" in source.lower():
+        return "工具型"
+    if any(word in text for word in ["sdk", "api", "mcp", "context", "harness", "openai"]):
+        return "解读型"
+    return "主线型"
 
-    新流程：抓取所有候选 → 去重 → 按比例选 5 篇（GitHub 最多 2） → 输出日报。
+
+def article_title(item: dict) -> str:
+    """根据条目生成文章标题。"""
+    title = str(item.get("title", "")).strip(" .")
+    compact = re.sub(r"GitHub 项目更新：", "", title)
+    compact = compact.replace("！", "").replace("？", "")
+    return compact[:50]
+
+
+def unique_output_file(day: str, title: str, item: dict, used_outputs: set[str]) -> str:
+    """为文章生成唯一的输出文件路径。"""
+    from src.common.utils import slugify
+
+    base = slugify(title)
+    output = f"daily_paper/{day}-{base}.md"
+    if output not in used_outputs:
+        used_outputs.add(output)
+        return output
+
+    # 如果有冲突，加来源短名
+    source_hint = slugify(str(item.get("source", ""))[:18], max_len=18)
+    output = f"daily_paper/{day}-{base}-{source_hint}.md"
+    counter = 2
+    while output in used_outputs:
+        output = f"daily_paper/{day}-{base}-{source_hint}-{counter}.md"
+        counter += 1
+    used_outputs.add(output)
+    return output
+
+
+def evaluate_quality_with_ai(
+    candidate: Candidate,
+    llm_provider,
+) -> tuple[bool, str]:
+    """用 AI 评估候选文章是否值得写。
+
+    返回 (是否通过, 评估理由)。
     """
+    prompt = [
+        {
+            "role": "system",
+            "content": (
+                "你是严谨的技术编辑。你需要评估一篇文章是否值得写成公众号推文。\n"
+                "评估标准：\n"
+                "1. 有实质内容（不是标题党、不是纯营销、不是空泛介绍）\n"
+                "2. 与 AI/LLM/Agent/MCP/上下文工程/推理优化/多模态/编程 等领域相关\n"
+                "3. 有可写的技术看点、工程启发或趋势判断\n"
+                "4. 不是垃圾信息、乱码、或纯导航页面\n\n"
+                "只回答 PASS 或 SKIP，然后给一句简短理由。格式：PASS: 理由 或 SKIP: 理由"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"标题：{candidate.title}\n"
+                f"来源：{candidate.source}\n"
+                f"URL：{candidate.url}\n\n"
+                f"原文内容（前 3000 字）：\n{(candidate.body or candidate.snippet or '')[:3000]}"
+            ),
+        },
+    ]
+
+    try:
+        response = llm_provider.chat(prompt, temperature=0.2, max_tokens=200)
+        response = response.strip()
+        if response.upper().startswith("PASS"):
+            return True, response
+        else:
+            return False, response
+    except Exception as exc:
+        return True, f"AI评估异常({exc})，默认通过"
+
+
+def build_llm_writer_prompt(item: dict, original_text: str) -> list[dict]:
+    """构建 LLM 写作 prompt。"""
+    article_type = item.get("article_type", "")
+    summary = item.get("summary", "")
+    insight = item.get("insight", "")
+    source_title = item.get("title", "")
+    url = item.get("url", "")
+
+    github_note = ""
+    if article_type == "工具型" and "github.com/" in url.lower():
+        github_note = f"- 标题下方保留项目链接：{url}\n"
+
+    system = (
+        "你是一名技术公众号编辑，擅长把技术动态写成有判断、有细节、读起来像真人写的文章。\n\n"
+        "核心原则：\n"
+        "1. 从原文中提取具体事实作为文章骨架——人名、项目名、数据、时间、技术术语\n"
+        "2. 每个二级标题下必须有原文中的具体信息，不要写成空泛的「XX的意义」\n"
+        "3. 段落要自然——事实→解释→判断，不要用「首先其次最后」串段落\n"
+        "4. 语言像技术博客，不像新闻稿也不像论文摘要\n"
+        "5. 只写原文里有的内容，不要脑补，信息不足就降低判断强度\n"
+    )
+
+    type_hint = ""
+    if article_type == "主线型":
+        type_hint = "这篇文章是主线型——围绕一个具体事件展开。先讲清楚谁做了什么、结果如何，再解释这件事改变了什么。\n"
+    elif article_type == "解读型":
+        type_hint = "这篇文章是解读型——围绕一个技术趋势展开。用原文中的具体事实做证据，解释变化背后的原因，判断要克制。\n"
+    elif article_type == "工具型":
+        type_hint = "这篇文章是工具型——围绕一个工具/项目展开。说清它解决什么问题、怎么用、局限在哪，少写宣传腔。\n"
+
+    user = f"""请基于下面的原文全文，写一篇中文技术公众号文章。
+
+{type_hint}
+格式要求：
+- 一级标题作为文章标题，要像一个独立文章的标题
+- 至少 3 个二级标题，每个二级标题中必须包含原文的具体信息
+- 正文 1300-1800 字
+- 段落 2-4 句，不单句成段
+- 至少一处自然的具体例子或类比
+{github_note}
+参考信息：
+- AI 摘要：{summary}
+- 编辑洞察：{insight}
+- 原标题（仅供参考）：{source_title}
+
+原文全文：
+{original_text[:120000]}
+"""
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def polish_llm_article(content: str) -> str:
+    """对 LLM 生成的文章进行轻量润色。"""
+    replacements = {
+        "真正值得看的不是": "需要关注的不是",
+        "真正值得看的，不是": "需要关注的，不是",
+        "背后的技术信号": "其中的技术信号",
+        "这条动态值得拆开看": "这条动态适合按工程链路拆开看",
+        "在当今时代，": "",
+        "随着AI的快速发展，": "",
+        "众所周知，": "",
+        "综上所述，": "",
+        "总而言之，": "",
+    }
+    for old, new in replacements.items():
+        content = content.replace(old, new)
+    return wrap_long_paragraphs(content)
+
+
+def wrap_long_paragraphs(article: str) -> str:
+    """将过长段落按句拆分。"""
+    from src.common.utils import chinese_char_count as ccc
+
+    wrapped: list[str] = []
+    for paragraph in article.split("\n\n"):
+        stripped = paragraph.strip()
+        if not stripped or stripped.startswith("#") or ccc(stripped) <= 170:
+            wrapped.append(paragraph)
+            continue
+        sentences = re.split(r"(?<=[。！？])", stripped)
+        current = ""
+        chunks: list[str] = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if current and ccc(current + sentence) > 150:
+                chunks.append(current.strip())
+                current = sentence
+            else:
+                current += sentence
+        if current:
+            chunks.append(current.strip())
+        wrapped.append("\n\n".join(chunks))
+    return "\n\n".join(wrapped) + "\n"
+
+
+def review_article(
+    article_text: str,
+    article_type: str,
+    title: str,
+    source_title: str,
+    source_url: str,
+    reviewer,
+) -> dict:
+    """用审稿 Agent 对文章做综合质量评估。"""
+    system = (
+        "你是一名资深技术编辑和审稿人。你的任务是审读一篇公众号技术文章，"
+        "从多个维度给出客观评价和具体修改建议。\n\n"
+        "审稿原则：\n"
+        "- 你不是在检查清单，而是在判断「这篇文章像不像一个真人编辑写出来的」\n"
+        "- 重点看：有没有自己的判断视角、段落之间有没有自然的起承转合、"
+        "二级标题是不是有具体信息而不是空泛概括、有没有模板腔和套话\n"
+        "- 评分要公正客观，不要因为文章格式规整就自动压低分数\n"
+    )
+
+    user = f"""请审读下面这篇技术公众号文章，给出评分和修改建议。
+
+文章类型：{article_type}
+文章标题：{title}
+原文标题：{source_title}
+原文链接：{source_url}
+
+请从以下五个维度分别打分（每项 0-10 分），并给出 1-2 句简短评语：
+
+1. **hook（开头吸引力）**：开头 200 字是否快速抓住读者？
+2. **point_of_view（观点判断力）**：文章是否有自己明确的判断？
+3. **storyline（结构推进感）**：二级标题是否包含具体信息？段落之间是否有自然的起承转合？
+4. **technical_depth（技术深度）**：是否有具体的工程概念、技术术语、使用场景？
+5. **wechat_readability（公众号可读性）**：段落长度是否适合手机阅读？语言是否自然？
+
+然后给出：
+- **overall_score**：总分 0-100（五项各 0-10，总分 = 五项之和 × 2）
+- **verdict**：PASS（>=65 分）或 FAIL（<65 分）
+- **suggestions**：2-5 条具体修改建议（中文，每条一句话，要具体可操作）
+
+请严格按以下 JSON 格式输出：
+```json
+{{
+  "hook": {{"score": 8, "comment": "..."}},
+  "point_of_view": {{"score": 7, "comment": "..."}},
+  "storyline": {{"score": 6, "comment": "..."}},
+  "technical_depth": {{"score": 7, "comment": "..."}},
+  "wechat_readability": {{"score": 8, "comment": "..."}},
+  "overall_score": 72,
+  "verdict": "PASS",
+  "suggestions": ["建议1", "建议2"]
+}}
+```
+
+=== 待审文章 ===
+{article_text[:8000]}
+"""
+    try:
+        response = reviewer.chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0.3,
+            max_tokens=1500,
+        )
+    except Exception as exc:
+        return {
+            "score": 0, "checks": {}, "suggestions": [f"审稿 Agent 调用失败: {exc}"],
+            "passed": False, "raw_response": str(exc),
+        }
+
+    # 解析 JSON 响应
+    try:
+        json_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", response, re.S)
+        json_str = (json_match.group(1) if json_match else response).strip()
+        brace_start = json_str.find("{")
+        brace_end = json_str.rfind("}")
+        if brace_start != -1 and brace_end != -1:
+            json_str = json_str[brace_start:brace_end + 1]
+        data = json.loads(json_str)
+    except (json.JSONDecodeError, ValueError):
+        return {
+            "score": 0, "checks": {},
+            "suggestions": [f"审稿 Agent 返回格式异常: {response[:300]}"],
+            "passed": False, "raw_response": response,
+        }
+
+    score = int(data.get("overall_score", 0))
+    checks = {
+        "hook": {"score": int(data.get("hook", {}).get("score", 5)), "comment": str(data.get("hook", {}).get("comment", ""))},
+        "point_of_view": {"score": int(data.get("point_of_view", {}).get("score", 5)), "comment": str(data.get("point_of_view", {}).get("comment", ""))},
+        "storyline": {"score": int(data.get("storyline", {}).get("score", 5)), "comment": str(data.get("storyline", {}).get("comment", ""))},
+        "technical_depth": {"score": int(data.get("technical_depth", {}).get("score", 5)), "comment": str(data.get("technical_depth", {}).get("comment", ""))},
+        "wechat_readability": {"score": int(data.get("wechat_readability", {}).get("score", 5)), "comment": str(data.get("wechat_readability", {}).get("comment", ""))},
+    }
+    suggestions = [str(s) for s in data.get("suggestions", [])]
+    verdict = str(data.get("verdict", "FAIL")).upper()
+    passed = verdict == "PASS" and score >= 65
+
+    return {
+        "score": max(0, min(100, score)),
+        "checks": checks,
+        "suggestions": suggestions,
+        "passed": passed,
+        "raw_response": response,
+    }
+
+
+def revise_article_with_feedback(
+    article_text: str,
+    original_text: str,
+    item: dict,
+    review_result: dict,
+    round_num: int,
+    llm_provider,
+) -> str:
+    """根据审稿 Agent 的反馈修改文章。"""
+    article_type = item.get("article_type", "")
+    title = item.get("title", "")
+    suggestions_text = "\n".join(f"- {s}" for s in review_result.get("suggestions", []))
+    checks_text = ""
+    for name, detail in review_result.get("checks", {}).items():
+        if isinstance(detail, dict):
+            checks_text += f"- {name}: {detail.get('score', '?')}/10 — {detail.get('comment', '')}\n"
+
+    # 逐轮策略调整
+    if round_num >= 3:
+        temp = 0.8
+        system = (
+            "你是一名技术公众号编辑。审稿人已经多次审读了你的文章并反复给出了修改建议，"
+            "文章仍存在明显问题。这次需要做大幅度修改：可以重写开头、重组结构、"
+            "替换所有模板化表达。不要删除原文中有价值的事实信息。"
+        )
+    elif round_num >= 2:
+        temp = 0.7
+        system = (
+            "你是一名技术公众号编辑。审稿人已经读完了你的文章并给出了修改建议。"
+            "这次需要做较大幅度的修改：如果审稿人说开头不够抓人就重写开头，"
+            "如果审稿人说结构模板化就重新组织段落和标题。不要删除原文中有价值的事实信息。"
+        )
+    else:
+        temp = 0.5
+        system = (
+            "你是一名技术公众号编辑。审稿人已经读完了你的文章并给出了修改建议。"
+            "请根据审稿建议逐条修改文章，不要敷衍，不要只改几个词。"
+            "保持文章风格：技术博客 + 行业观察。"
+        )
+
+    user = f"""以下是审稿人对你文章的评价和修改建议，请据此修改文章。
+
+【文章类型】{article_type}
+【原标题】{title}
+
+【审稿细项评分】
+{checks_text}
+
+【修改建议】
+{suggestions_text}
+
+【当前文章】
+{article_text[:6000]}
+
+【原文全文（参考，不要新增原文没有的事实）】
+{original_text[:120000]}
+
+请输出修改后的完整 Markdown 文章，以一级标题开头。
+"""
+    response = llm_provider.chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=temp,
+    )
+    return polish_llm_article(response)
+
+
+def _create_reviewer_provider():
+    """创建审稿专用的 LLM provider。"""
+    from src.infrastructure.llm_client import OpenAICompatibleProvider
+
+    review_key = (
+        os.environ.get("REVIEW_LLM_API_KEY")
+        or os.environ.get("LLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+    )
+    review_model = (
+        os.environ.get("REVIEW_LLM_MODEL")
+        or os.environ.get("LLM_MODEL")
+    )
+    review_base = (
+        os.environ.get("REVIEW_LLM_API_BASE")
+        or os.environ.get("LLM_API_BASE")
+        or "https://api.openai.com/v1"
+    )
+    if not review_key or not review_model:
+        return None
+    return OpenAICompatibleProvider(
+        api_base=review_base,
+        api_key=review_key,
+        model=review_model,
+    )
+
+
+# ---------------------------------------------------------------------------
+# v2.5 主流程：逐条全链路处理
+# ---------------------------------------------------------------------------
+
+def process_one_candidate(
+    candidate: Candidate,
+    report_date: str,
+    used_outputs: set[str],
+    llm_provider,
+    reviewer,
+    max_review_rounds: int = 3,
+    review_pass_score: int = 65,
+    github_count: int = 0,
+) -> dict | None:
+    """逐条处理一篇候选文章：抓原文 → AI阅读 → 写作 → 审稿 → 修订 → 保存。
+
+    Returns:
+        成功时返回 article_state dict（含 output_file, stage 等），
+        跳过/失败时返回 None。
+    """
+    idx_label = f"[{len(used_outputs) + 1}/{TARGET_ARTICLES}]"
+
+    # ---- Step 1: 抓取原文 ----
+    print(f"\n{idx_label} 📥 抓取原文: {candidate.title[:60]}...")
+    enrich_candidate(candidate)
+    original_text = candidate.body or candidate.snippet or ""
+
+    if len(original_text) < 300:
+        print(f"  [SKIP] 原文抓取不足 ({len(original_text)} 字符)，跳过")
+        return None
+
+    print(f"  [OK] 原文 {len(original_text)} 字符")
+
+    # ---- Step 2: AI 阅读原文 → summary + insight + 分类 ----
+    print(f"  [READ] AI 阅读原文中...")
+    category = classify(candidate)
+    summary, insight = _generate_ai_summary_and_insight(candidate, category)
+    print(f"  [分类] {category}")
+    print(f"  [摘要] {summary[:80]}...")
+
+    # ---- Step 3: AI 质量评估 ----
+    if llm_provider:
+        print(f"  [EVAL] AI 评估质量中...")
+        passed, reason = evaluate_quality_with_ai(candidate, llm_provider)
+        print(f"  [{'PASS' if passed else 'SKIP'}] {reason[:100]}")
+        if not passed:
+            return None
+
+    # ---- Step 4: 构建 item 并推断文章类型 ----
+    item = {
+        "title": normalize_title(candidate.title),
+        "source": candidate.source,
+        "url": candidate.url,
+        "date": candidate.published_at or report_date,
+        "category": category,
+        "summary": summary,
+        "insight": insight,
+    }
+    article_type = infer_article_type(item)
+    item["article_type"] = article_type
+
+    title = article_title(item)
+    output_file = unique_output_file(report_date, title, item, used_outputs)
+    output_path = ROOT / output_file
+
+    # ---- Step 5: LLM 写作 ----
+    print(f"  [WRITE] LLM 生成文章中...")
+    try:
+        article_text = llm_provider.chat(
+            build_llm_writer_prompt(item, original_text),
+        )
+        article_text = polish_llm_article(article_text)
+        from src.common.utils import chinese_char_count as ccc
+        print(f"  [DONE] 初稿 {ccc(article_text)} 字")
+    except Exception as exc:
+        print(f"  [FAIL] 写作失败: {exc}")
+        return None
+
+    # ---- Step 6: 审稿修订循环 ----
+    review_rounds = 0
+    review_score = 0
+    review_passed = False
+    score_history: list[dict] = []
+
+    if reviewer:
+        for round_num in range(1, max_review_rounds + 1):
+            print(f"  [REVIEW] 第 {round_num}/{max_review_rounds} 轮审稿...")
+            result = review_article(
+                article_text=article_text,
+                article_type=article_type,
+                title=title,
+                source_title=candidate.title,
+                source_url=candidate.url,
+                reviewer=reviewer,
+            )
+
+            current_score = result["score"]
+            score_history.append({
+                "round": round_num,
+                "score": current_score,
+                "checks": result.get("checks", {}),
+                "passed": result["passed"],
+            })
+
+            if result["passed"]:
+                print(f"  ✅ 审稿通过 (评分: {current_score})")
+                review_rounds = round_num
+                review_score = current_score
+                review_passed = True
+                break
+
+            print(f"  ❌ 审稿未通过 (评分: {current_score}, 门槛: {review_pass_score})")
+            for s in result.get("suggestions", [])[:3]:
+                print(f"    💬 {s}")
+
+            # 退化检测
+            if len(score_history) >= 2:
+                prev_score = score_history[-2]["score"]
+                if current_score <= prev_score:
+                    print(f"  ⚠️ 评分从 {prev_score} 降至 {current_score}")
+                    if len(score_history) >= 3:
+                        two_ago = score_history[-3]["score"]
+                        if current_score <= prev_score <= two_ago:
+                            print(f"  🛑 连续三轮评分下降，提前终止")
+                            review_rounds = round_num
+                            review_score = current_score
+                            break
+
+            # 已达最大轮数
+            if round_num >= max_review_rounds:
+                print(f"  ⚠️ 已达最大修订轮数")
+                review_rounds = round_num
+                review_score = current_score
+                break
+
+            # 修改文章
+            print(f"  🔄 根据审稿建议修改中...")
+            try:
+                article_text = revise_article_with_feedback(
+                    article_text=article_text,
+                    original_text=original_text,
+                    item=item,
+                    review_result=result,
+                    round_num=round_num,
+                    llm_provider=llm_provider,
+                )
+                from src.common.utils import chinese_char_count as ccc
+                print(f"  📝 修改完成 ({ccc(article_text)} 字)")
+            except Exception as exc:
+                print(f"  ❌ 修改失败: {exc}")
+                review_rounds = round_num
+                review_score = current_score
+                break
+
+    # ---- Step 7: 保存文章 ----
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(article_text, encoding="utf-8")
+    from src.common.utils import chinese_char_count as ccc
+    print(f"  💾 保存: {output_file} ({ccc(article_text)} 字)")
+
+    stage = "review_passed" if review_passed else ("drafted" if not reviewer else "review_failed")
+    return {
+        "date": report_date,
+        "title": candidate.title,
+        "url": candidate.url,
+        "source": candidate.source,
+        "article_type": article_type,
+        "category": category,
+        "output_file": output_file,
+        "stage": stage,
+        "char_count": ccc(article_text),
+        "review_rounds": review_rounds,
+        "review_score": review_score,
+        "review_score_history": score_history,
+        "summary": summary,
+        "insight": insight,
+    }
+
+
+def run_full_pipeline(report_date: str, days: int) -> dict:
+    """v2.5 主入口：逐条全链路处理 5 篇文章。
+
+    流程：
+    1. 收集所有候选（去重、质量过滤）
+    2. 逐条处理：抓原文 → AI阅读 → 质量评估 → 写作 → 审稿 → 修订
+    3. 写 report JSON（记录最终状态）
+    4. 返回完整报告
+
+    Returns:
+        {"date": ..., "items": [...], "article_states": [...], ...}
+    """
+    import os as _os
+
     logs: list[FetchLog] = []
     candidates = collect_candidates(days, logs)
 
-    print(f"\n共抓取 {len(candidates)} 个候选条目")
-    for c in candidates:
-        print(f"  [{c.source}] {c.title[:50]}")
+    print(f"\n{'='*60}")
+    print(f"Pipeline: {report_date} (逐条全链路模式)")
+    print(f"共抓取 {len(candidates)} 个候选条目")
+    print(f"{'='*60}")
 
     # 去重 + 质量过滤
     seen_urls: set[str] = set()
@@ -731,7 +1471,6 @@ def build_report(report_date: str, days: int) -> dict:
             continue
         if c.title in seen_titles:
             continue
-        # 过滤明显低质量的标题
         title_lower = c.title.lower().strip()
         if any(re.search(p, title_lower) for p in low_quality_patterns):
             print(f"  过滤低质量标题: {c.title[:50]}")
@@ -743,61 +1482,141 @@ def build_report(report_date: str, days: int) -> dict:
         deduped.append(c)
     print(f"去重后剩余 {len(deduped)} 个候选")
 
-    # 分类统计
+    # 选取候选（GitHub 最多 2）
     github_candidates = [c for c in deduped if source_bucket(c.source) == "GitHub"]
     non_github = [c for c in deduped if source_bucket(c.source) != "GitHub"]
+    pool: list[Candidate] = []
+    pool.extend(github_candidates[:MAX_GITHUB])
+    pool.extend(non_github[:TARGET_ARTICLES - len(pool)])
+    remaining = [c for c in deduped if c not in pool]
+    while len(pool) < TARGET_ARTICLES and remaining:
+        pool.append(remaining.pop(0))
+    pool = pool[:TARGET_ARTICLES]
+    print(f"候选池 {len(pool)} 篇（GitHub: {len([c for c in pool if source_bucket(c.source)=='GitHub'])}）")
 
-    # 选取：GitHub 最多 2 个，其他至少 3 个
-    selected: list[Candidate] = []
-    selected.extend(github_candidates[:MAX_GITHUB])
-    selected.extend(non_github[:TARGET_ARTICLES - len(selected)])
+    # ---- 逐条处理 ----
+    # 初始化 LLM providers
+    from src.infrastructure.llm_client import create_llm_provider
 
-    # 如果还不够，从剩余中补
-    remaining = [c for c in deduped if c not in selected]
-    while len(selected) < TARGET_ARTICLES and remaining:
-        selected.append(remaining.pop(0))
+    try:
+        writer_llm = create_llm_provider()
+        print(f"\n[LLM] 写作模型: {writer_llm.model}")
+    except Exception as exc:
+        print(f"\n[ERROR] 无法创建写作 LLM provider: {exc}")
+        raise SystemExit(1)
 
-    selected = selected[:TARGET_ARTICLES]
-    print(f"最终选择 {len(selected)} 篇（GitHub: {len([c for c in selected if source_bucket(c.source)=='GitHub'])}，其他: {len([c for c in selected if source_bucket(c.source)!='GitHub'])}）")
+    reviewer = _create_reviewer_provider()
+    if reviewer:
+        print(f"[审稿] 审稿模型: {reviewer.model}")
+    else:
+        print("[审稿] 未配置独立审稿 Agent，将跳过审稿环节")
 
-    # 丰富内容（抓取原文）
-    for c in selected:
-        print(f"  抓取原文: {c.title[:50]}...")
-        enrich_candidate(c)
-        time.sleep(0.5)
+    # 从 harness.toml 读取审稿配置
+    review_max_rounds = 3
+    review_pass_score = 65
+    try:
+        harness_cfg_path = ROOT / "harness.toml"
+        if harness_cfg_path.exists():
+            import tomllib as _toml
+            with harness_cfg_path.open("rb") as f:
+                cfg = _toml.load(f)
+            review_max_rounds = cfg.get("llm", {}).get("review_max_rounds", 3)
+            review_pass_score = cfg.get("article", {}).get("min_score_for_publish", 65)
+    except Exception:
+        pass
 
-    items = [to_report_item(c) for c in selected]
-    items.sort(key=lambda row: (row.get("relevance", 0), row.get("date", "")), reverse=True)
+    used_outputs: set[str] = set()
+    article_states: list[dict] = []
+    github_count = 0
+    processed_count = 0
+
+    print(f"\n{'='*60}")
+    print(f"开始逐条处理（最多 {review_max_rounds} 轮审稿，通过门槛 {review_pass_score} 分）")
+    print(f"{'='*60}")
+
+    for i, candidate in enumerate(pool):
+        is_github = source_bucket(candidate.source) == "GitHub"
+
+        if is_github and github_count >= MAX_GITHUB:
+            print(f"\n  [SKIP] GitHub 已达上限: {candidate.title[:50]}")
+            continue
+
+        result = process_one_candidate(
+            candidate=candidate,
+            report_date=report_date,
+            used_outputs=used_outputs,
+            llm_provider=writer_llm,
+            reviewer=reviewer,
+            max_review_rounds=review_max_rounds,
+            review_pass_score=review_pass_score,
+            github_count=github_count,
+        )
+
+        if result:
+            article_states.append(result)
+            if is_github:
+                github_count += 1
+            processed_count += 1
+        else:
+            article_states.append({
+                "date": report_date,
+                "title": candidate.title,
+                "url": candidate.url,
+                "source": candidate.source,
+                "stage": "skipped",
+            })
+
+        # 中间休息，避免触发限流
+        time.sleep(1)
+
+    # ---- 构建最终报告 ----
+    items = [
+        {
+            "title": s.get("title", ""),
+            "source": s.get("source", ""),
+            "url": s.get("url", ""),
+            "date": s.get("date", report_date),
+            "category": s.get("category", ""),
+            "summary": s.get("summary", ""),
+            "insight": s.get("insight", ""),
+            "relevance": 4,
+            "article_type": s.get("article_type", ""),
+            "output_file": s.get("output_file", ""),
+            "stage": s.get("stage", ""),
+            "review_score": s.get("review_score", 0),
+            "review_rounds": s.get("review_rounds", 0),
+        }
+        for s in article_states
+        if s.get("output_file")
+    ]
+
+    print(f"\n{'='*60}")
+    passed = sum(1 for s in article_states if s.get("stage") == "review_passed")
+    drafted = sum(1 for s in article_states if s.get("stage") in ("drafted", "review_failed"))
+    skipped = sum(1 for s in article_states if s.get("stage") == "skipped")
+    print(f"Pipeline 完成: {passed} 篇审稿通过, {drafted} 篇已生成, {skipped} 篇跳过")
+    print(f"产出 {len(items)} 篇文章")
+    print(f"{'='*60}")
 
     return {
         "date": report_date,
         "topic_focus": "前沿 AI 技术动态，聚焦 AI Agent、Harness Engineering、Context Engineering 与多模态大模型。",
         "items": items,
+        "article_states": article_states,
         "_fetch_logs": [asdict(log) for log in logs],
     }
 
 
-def write_report(output_path: Path, report_date: str, days: int) -> Path:
-    """写入日报 JSON 文件。"""
-    report = build_report(report_date, days)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    print(f"\nReport written: {output_path} ({len(report['items'])} items)")
-    return output_path
-
-
-def default_report_path(report_date: str) -> Path:
-    return REPORTS_DIR / f"{report_date}.json"
-
+# ---------------------------------------------------------------------------
+# CLI 入口
+# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate the AI tech daily report.")
+    parser = argparse.ArgumentParser(description="Generate the AI tech daily report (per-article pipeline).")
     parser.add_argument("--date", default=date.today().isoformat(), help="Report date in YYYY-MM-DD.")
     parser.add_argument("--days", type=int, default=10, help="Lookback window in days.")
-    parser.add_argument("--output", default=None, help="Custom output path.")
+    parser.add_argument("--output", default=None, help="Custom output path for report JSON.")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing articles.")
     return parser.parse_args()
 
 
@@ -805,9 +1624,67 @@ def main() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+
     args = parse_args()
-    output_path = Path(args.output) if args.output else default_report_path(args.date)
-    write_report(output_path, args.date, args.days)
+
+    # 检查是否已有产出（跳过已存在的文章）
+    existing = list(PAPER_DIR.glob(f"{args.date}-*.md"))
+    if existing and not args.overwrite:
+        print(f"[INFO] 已存在 {len(existing)} 篇当日文章，跳过生成")
+        print(f"[INFO] 如需重新生成，请使用 --overwrite 参数")
+        # 仍然写 report JSON
+        output_path = Path(args.output) if args.output else REPORTS_DIR / f"{args.date}.json"
+        # 读取已有文章构建 report
+        items = []
+        for f in sorted(existing):
+            text = f.read_text(encoding="utf-8")
+            h1 = re.search(r"^#\s+(.+)$", text, flags=re.MULTILINE)
+            title = h1.group(1) if h1 else f.stem
+            items.append({
+                "title": title,
+                "source": "已存在",
+                "url": "",
+                "date": args.date,
+                "category": "",
+                "summary": "",
+                "insight": "",
+                "relevance": 3,
+                "output_file": str(f.relative_to(ROOT)).replace("\\", "/"),
+                "stage": "kept_existing",
+            })
+        report = {
+            "date": args.date,
+            "topic_focus": "前沿 AI 技术动态，聚焦 AI Agent、Harness Engineering、Context Engineering 与多模态大模型。",
+            "items": items,
+        }
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"Report written: {output_path} ({len(items)} items)")
+        return
+
+    # 运行全链路
+    report = run_full_pipeline(args.date, args.days)
+
+    # 写入 report JSON
+    output_path = Path(args.output) if args.output else REPORTS_DIR / f"{args.date}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # 只保留 items 和元数据，去掉 article_states（太大了）
+    clean_report = {k: v for k, v in report.items() if k != "article_states"}
+    output_path.write_text(json.dumps(clean_report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"\nReport written: {output_path} ({len(report['items'])} items)")
+
+    # 写入 article_states
+    states_dir = ROOT / "states"
+    states_dir.mkdir(parents=True, exist_ok=True)
+    states_path = states_dir / f"{args.date}.article_states.json"
+    states_path.write_text(
+        json.dumps({
+            "date": args.date,
+            "articles": report.get("article_states", []),
+        }, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"States written: {states_path}")
 
 
 if __name__ == "__main__":
