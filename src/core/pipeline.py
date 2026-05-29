@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 
 from src.common.utils import load_json, write_json
 from src.infrastructure.error_logger import StageResult, write_error_log
+from src.middleware.pipeline_logger import PipelineLogger, init_logger
 
 load_dotenv()
 
@@ -88,25 +89,63 @@ def project_path(path: Path) -> str:
     return str(path.relative_to(ROOT)).replace("/", "\\")
 
 
-def run_stage(name: str, command: list[str]) -> StageResult:
+def run_stage(name: str, command: list[str], stream: bool = False, log: PipelineLogger | None = None) -> StageResult:
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
-    completed = subprocess.run(
-        command,
-        cwd=ROOT,
-        env=env,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-    )
-    result = StageResult(
-        name=name,
-        command=command,
-        returncode=completed.returncode,
-        stdout=completed.stdout,
-        stderr=completed.stderr,
-    )
+    if stream:
+        # 强制子进程无缓冲输出，否则管道读取会卡住
+        env["PYTHONUNBUFFERED"] = "1"
+
+    if log:
+        log.stage_start(name)
+
+    if stream:
+        # 实时流式输出——适合长时间运行的阶段（如 agent）
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        stdout_lines: list[str] = []
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            stdout_lines.append(line)
+        process.wait()
+        returncode = process.returncode or 0
+        stdout = "".join(stdout_lines)
+        result = StageResult(
+            name=name,
+            command=command,
+            returncode=returncode,
+            stdout=stdout,
+            stderr="",
+        )
+    else:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+        )
+        result = StageResult(
+            name=name,
+            command=command,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+    if log:
+        log.stage_end(name, success=result.ok, extra=f"cmd={' '.join(command)}")
     print_stage(result)
     return result
 
@@ -128,10 +167,14 @@ def state_path(day: str) -> Path:
 # 验证
 # ---------------------------------------------------------------------------
 
-def verify_selected_articles(report_path: Path, article_states: list[dict]) -> list[StageResult]:
+def verify_selected_articles(report_path: Path, article_states: list[dict], log: PipelineLogger | None = None) -> list[StageResult]:
     """对 article_states 中已产出的文章逐篇运行 verify_article。"""
     results: list[StageResult] = []
     seen: set[str] = set()
+    total = sum(1 for s in article_states if s.get("stage") in (
+        "kept_existing", "drafted", "revised", "review_passed", "review_failed",
+    ))
+    idx = 0
     for state in article_states:
         output_file = state.get("output_file")
         if not output_file or output_file in seen:
@@ -144,6 +187,9 @@ def verify_selected_articles(report_path: Path, article_states: list[dict]) -> l
         output_path = ROOT / output_file
         if not output_path.exists():
             continue
+        idx += 1
+        if log:
+            log.info(f"验证文章 [{idx}/{total}]: {Path(output_file).name}")
         results.append(
             run_stage(
                 f"verify article {Path(output_file).name}",
@@ -154,6 +200,7 @@ def verify_selected_articles(report_path: Path, article_states: list[dict]) -> l
                     output_file,
                     "--verbose",
                 ],
+                log=log,
             )
         )
     return results
@@ -203,8 +250,21 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     configure_console()
     args = parse_args()
+
+    # ---- 初始化日志器 ----
+    log = init_logger(args.date)
+    log.separator(f"Pipeline Start: {args.date}")
+
+    log.info("加载规则契约 AGENT.md ...")
     agent_rules = load_agent_rules()
+    log.info(f"AGENT.md 已加载 ({len(agent_rules)} chars)")
+
+    log.info("加载配置 harness.toml ...")
     harness_cfg = load_harness_config()
+    pipeline_cfg = harness_cfg.get("pipeline", {})
+    target_count = pipeline_cfg.get("target_article_count", 5)
+    max_github = pipeline_cfg.get("max_github", 2)
+    log.info(f"配置: 目标 {target_count} 篇, GitHub 最多 {max_github} 篇, 回溯 {args.days} 天")
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     PAPER_DIR.mkdir(parents=True, exist_ok=True)
@@ -212,21 +272,11 @@ def main() -> None:
     report_path = REPORTS_DIR / f"{args.date}.json"
     results: list[StageResult] = []
 
-    # 从 harness.toml 读取参数
-    pipeline_cfg = harness_cfg.get("pipeline", {})
-    target_count = pipeline_cfg.get("target_article_count", 5)
-    max_github = pipeline_cfg.get("max_github", 2)
-
-    print(f"Read rule contract: {project_path(AGENT_RULES)} ({len(agent_rules)} chars)")
-    print(f"\n{'='*60}")
-    print(f"Pipeline: {args.date} (编排层 v3.0)")
-    print(f"目标: {target_count} 篇文章 (GitHub 最多 {max_github})")
-    print(f"{'='*60}")
-
     # -----------------------------------------------------------------------
     # Stage 1: 运行 agent.main() 生成报告 + 文章
     # -----------------------------------------------------------------------
     if not args.skip_fetch:
+        log.info("Stage 1/3: 启动 agent 全链路生成（抓取→阅读→写作→审稿→保存）...")
         agent_cmd = [
             sys.executable,
             "-m",
@@ -238,30 +288,41 @@ def main() -> None:
         ]
         if args.overwrite:
             agent_cmd.append("--overwrite")
-        results.append(run_stage("run agent (full pipeline)", agent_cmd))
+        results.append(run_stage("run agent (full pipeline)", agent_cmd, stream=True, log=log))
 
         if not results[-1].ok:
+            log.error("Stage 1 失败，写入错误日志...")
             write_error_log(args.date, results, ERRORS_DIR)
+            log.separator("Pipeline FAILED at Stage 1")
+            log.close()
             raise SystemExit(results[-1].returncode)
     elif not report_path.exists():
+        log.error(f"skip-fetch 模式但 report 不存在: {project_path(report_path)}")
+        log.close()
         raise SystemExit(f"Missing existing report: {project_path(report_path)}")
 
     # -----------------------------------------------------------------------
     # Stage 2: 验证 base report JSON
     # -----------------------------------------------------------------------
+    log.info("Stage 2/3: 验证 base report JSON ...")
     results.append(
         run_stage(
             "verify base report",
             [sys.executable, "-m", "src.validators.verify", project_path(report_path)],
+            log=log,
         )
     )
     if not results[-1].ok:
+        log.error("Stage 2 失败，写入错误日志...")
         write_error_log(args.date, results, ERRORS_DIR)
+        log.separator("Pipeline FAILED at Stage 2")
+        log.close()
         raise SystemExit(results[-1].returncode)
 
     # -----------------------------------------------------------------------
     # Stage 3: 加载 article_states + 逐篇验证文章
     # -----------------------------------------------------------------------
+    log.info("Stage 3/3: 逐篇验证文章 ...")
     article_states_path = state_path(args.date)
     article_states: list[dict] = []
 
@@ -269,18 +330,29 @@ def main() -> None:
         try:
             states_data = load_json(article_states_path)
             article_states = states_data.get("articles", [])
-            print(f"\n[INFO] 加载 {len(article_states)} 条 article states")
+            log.info(f"已加载 {len(article_states)} 条 article states")
         except Exception as exc:
-            print(f"[WARN] 读取 article_states 失败: {exc}")
+            log.warn(f"读取 article_states 失败: {exc}")
 
     if article_states:
-        article_results = verify_selected_articles(report_path, article_states)
+        total = len(article_states)
+        log.info(f"开始逐篇验证 {total} 篇文章 ...")
+        article_results = verify_selected_articles(report_path, article_states, log=log)
         update_article_states(report_path, article_results, article_states)
         results.extend(article_results)
 
+        passed = sum(1 for r in article_results if r.ok)
+        failed = total - passed
+        log.info(f"文章验证完成: {passed} 通过, {failed} 失败")
+
         if not all(r.ok for r in article_results):
+            log.error("存在验证失败的文章，写入错误日志...")
             write_error_log(args.date, results, ERRORS_DIR)
+            log.separator(f"Pipeline FAILED at Stage 3 ({passed}/{total} passed)")
+            log.close()
             raise SystemExit(1)
+    else:
+        log.warn("没有可验证的文章（article_states 为空或不存在）")
 
     # -----------------------------------------------------------------------
     # 汇总
@@ -289,9 +361,9 @@ def main() -> None:
     failed = sum(1 for s in article_states if s.get("stage") == "verify_failed")
     other = len(article_states) - passed - failed
 
-    print("\n" + "=" * 60)
-    print(f"Pipeline completed: {passed} 篇验证通过, {failed} 篇验证失败, {other} 篇其他状态")
-    print("=" * 60)
+    log.separator(f"Pipeline COMPLETED: {passed} passed, {failed} failed, {other} other")
+    log.info(f"日志文件: logs/pipeline-{args.date}.log")
+    log.close()
 
 
 if __name__ == "__main__":

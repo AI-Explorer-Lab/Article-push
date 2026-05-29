@@ -1628,6 +1628,9 @@ def main() -> None:
 
     args = parse_args()
 
+    print(f"[AGENT] 启动 agent for date={args.date}, days={args.days}, overwrite={args.overwrite}")
+    sys.stdout.flush()
+
     # 检查是否已有产出（跳过已存在的文章）
     existing = list(PAPER_DIR.glob(f"{args.date}-*.md"))
     if existing and not args.overwrite:
