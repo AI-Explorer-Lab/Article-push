@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -1632,24 +1633,44 @@ def main() -> None:
     if existing and not args.overwrite:
         print(f"[INFO] 已存在 {len(existing)} 篇当日文章，跳过生成")
         print(f"[INFO] 如需重新生成，请使用 --overwrite 参数")
-        # 仍然写 report JSON
+
         output_path = Path(args.output) if args.output else REPORTS_DIR / f"{args.date}.json"
-        # 读取已有文章构建 report
+
+        # 尝试从 article_states 回读元数据（上次运行时的真实数据）
+        states_dir = ROOT / "states"
+        states_path = states_dir / f"{args.date}.article_states.json"
+        states_by_file: dict[str, dict] = {}
+        if states_path.exists():
+            try:
+                states_data = json.loads(states_path.read_text(encoding="utf-8"))
+                for s in states_data.get("articles", []):
+                    out = s.get("output_file", "")
+                    if out:
+                        states_by_file[out] = s
+            except (json.JSONDecodeError, ValueError):
+                pass
+
         items = []
         for f in sorted(existing):
+            rel_path = str(f.relative_to(ROOT)).replace("\\", "/")
             text = f.read_text(encoding="utf-8")
             h1 = re.search(r"^#\s+(.+)$", text, flags=re.MULTILINE)
             title = h1.group(1) if h1 else f.stem
+
+            # 从 article_states 回读真实元数据
+            state = states_by_file.get(rel_path, {})
+            url = state.get("url", "") or f"file://{rel_path}"
+            category = state.get("category", "") or "AI Agent"
             items.append({
                 "title": title,
-                "source": "已存在",
-                "url": "",
-                "date": args.date,
-                "category": "",
-                "summary": "",
-                "insight": "",
+                "source": state.get("source", "") or "已存在",
+                "url": url,
+                "date": state.get("date", "") or args.date,
+                "category": category,
+                "summary": state.get("summary", "") or title,
+                "insight": state.get("insight", "") or INSIGHTS.get(category, ""),
                 "relevance": 3,
-                "output_file": str(f.relative_to(ROOT)).replace("\\", "/"),
+                "output_file": rel_path,
                 "stage": "kept_existing",
             })
         report = {
