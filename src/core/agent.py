@@ -1,14 +1,14 @@
 """src/core/agent.py - 逐条全链路 AI 技术日报生成器。
 
-架构（v2.5 逐条全链路版）：
+架构（v3.0 逐条全链路版）：
 对每条候选文章，按以下顺序逐条处理：
   1. 抓取文章链接（微信公众号/GitHub/博客）
   2. 抓取原文全文（enrich：Selenium → urllib → fallback）
   3. LLM 阅读原文 → 生成 summary（80-120字中文摘要）+ insight（独立判断）
   4. LLM 语义分类
   5. AI 质量评估（是否值得写）
-  6. LLM 写作（基于原文全文 + summary + insight）
-  7. 审稿 Agent 评分 → 不通过则逐轮修订（最多N轮）
+  6. LLM 写作（基于原文全文 + summary + insight，含模板腔规避约束）
+  7. 审稿 Agent 评分（含模板腔检测）→ 不通过则逐轮修订（最多N轮）
   8. 保存文章 + 写入 report JSON item → 丢弃上下文 → 处理下一条
 
 与旧版的关键区别：
@@ -16,6 +16,7 @@
 - 不再分 agent → report → writer 三个阶段
 - 每条文章的处理上下文在完成后立即丢弃
 - 不需要中间文件 report JSON 做阶段间通信
+- 模板腔规避和检测已交给 Agent，不再靠硬编码正则替换/匹配
 
 微信公众号抓取策略：
 - 优先使用 Selenium + Chrome 无头浏览器（可绕过搜狗反爬）
@@ -194,8 +195,9 @@ def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog], days
         articles = fetch_wechat_source_full(
             account_name=account_name,
             query=query,
-            max_articles=5,
+            max_articles=15,  # 翻页抓取更多，由 agent.py 日期过滤筛选当日文章
             headless=True,
+            days=days,
         )
         for article in articles:
             published_at = article.get("published_at", "")

@@ -24,6 +24,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -177,8 +178,9 @@ def fetch_sogou_wechat_with_browser(
 
         page_source = driver.page_source
 
-        # 检测反爬页面
+        # 检测反爬页面（Selenium 有反检测措施，通常不会被拦截，但如果被拦截则直接返回）
         if _is_antispider(page_source):
+            print("[browser_fetcher] 搜狗触发反爬验证，跳过")
             return results
 
         # 解析搜索结果块
@@ -355,12 +357,22 @@ def fetch_generic_page(url: str, headless: bool = True) -> str:
 # ---------------------------------------------------------------------------
 
 def _is_antispider(html_text: str) -> bool:
-    """检测是否为反爬页面。"""
+    """检测是否为搜狗反爬拦截页面。
+
+    注意：不检测 erweima 模板代码（搜狗正常页面也包含隐藏的二维码弹窗模板），
+    只检测真正的拦截页面特征。
+    """
     lowered = html_text.lower()
-    return any(
-        token in lowered
-        for token in ("antispider", "verify", "imgcode", "captcha")
-    )
+
+    # 真正的拦截页面特征
+    if any(token in lowered for token in ("antispider", "verifycode", "imgcode")):
+        return True
+
+    # captcha 关键词 + 拦截页面特有结构
+    if "captcha" in lowered and ("验证码" in lowered or "verify" in lowered):
+        return True
+
+    return False
 
 
 def _clean_html(html_text: str) -> str:
@@ -415,6 +427,7 @@ def fetch_wechat_source_full(
     query: str = "AI",
     max_articles: int = 5,
     headless: bool = True,
+    days: int = 7,
 ) -> list[dict]:
     """一站式抓取微信公众号来源的文章（含搜索 + URL 解析 + 内容抓取）。
 
@@ -425,6 +438,7 @@ def fetch_wechat_source_full(
         query: 搜索关键词
         max_articles: 最多抓取几篇
         headless: 是否无头模式
+        days: 时间回溯天数，用于搜狗 tsn 时间筛选参数
 
     Returns:
         dict 列表，每个包含: title, source, url(真实URL), published_at, snippet, body(全文)
@@ -435,7 +449,8 @@ def fetch_wechat_source_full(
 
     try:
         options = _create_chrome_options(headless=headless)
-        driver = webdriver.Chrome(options=options)
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
         driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
         driver.implicitly_wait(IMPLICIT_WAIT)
         driver.execute_script(
@@ -452,115 +467,179 @@ def fetch_wechat_source_full(
         return articles
 
     try:
-        # Step 1: 搜索搜狗微信
-        # 搜狗已不支持直接 URL 带 query 参数，必须先访问首页再通过搜索框提交
-        search_query = f"{account_name} {query}"
+        # Step 1: 直接构造搜狗微信搜索 URL 访问（不经过首页搜索框，避免 tsn 重定向问题）
+        # 注意：搜狗微信搜索通过首页搜索框提交后，再追加 tsn 参数刷新会被重定向回首页。
+        # 因此改为直接用 URL 方式搜索，时间筛选在后续代码层通过日期过滤完成。
+        search_query = f"{account_name} {query}".strip()
+
+        # 方案 A: 直接 URL 搜索（type=2 表示搜索文章）
+        search_url = f"https://weixin.sogou.com/weixin?type=2&query={search_query}"
         try:
-            # 先访问搜狗微信首页
-            driver.get("https://weixin.sogou.com/")
-            time.sleep(3)
-            # 找到搜索框并输入关键词
-            search_input = driver.find_element(By.ID, "query")
-            search_input.clear()
-            search_input.send_keys(search_query)
-            # 点击"搜文章"提交按钮
-            search_btn = driver.find_element(By.CSS_SELECTOR, "input[type='submit']")
-            search_btn.click()
-            time.sleep(4)
-            # 尝试点击"按时间排序"让最新文章排前面
-            try:
-                sort_by_time = driver.find_element(By.XPATH, "//a[contains(text(), '时间') or contains(text(), '时间排序')]")
-                sort_by_time.click()
-                time.sleep(3)
-                print("[browser_fetcher] 已切换到按时间排序")
-            except Exception:
-                pass  # 某些情况下排序按钮不可用，忽略
+            driver.get(search_url)
+            time.sleep(5)  # 等待 JS 渲染搜索结果
+
             # 等待搜索结果出现
             try:
-                WebDriverWait(driver, 8).until(
+                WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "li[id^='sogou_vr_']"))
                 )
             except TimeoutException:
                 time.sleep(3)
-        except Exception as exc:
-            print(f"[browser_fetcher] 搜索框提交失败: {exc}，尝试直接 URL")
-            # 回退：尝试直接 URL
-            try:
-                driver.get(f"https://weixin.sogou.com/weixin?type=2&query={search_query}&tsn=1")
+
+            # 如果直接 URL 方式被重定向回首页，回退到首页搜索框方式
+            page_source = driver.page_source
+            if len(page_source) < 10000 or "sogou_vr_" not in page_source:
+                print(f"[browser_fetcher] 直接URL被重定向(长度={len(page_source)})，改用首页搜索框方式")
+                driver.get("https://weixin.sogou.com/")
+                time.sleep(3)
+                search_input = driver.find_element(By.ID, "query")
+                search_input.clear()
+                search_input.send_keys(search_query)
+                search_btn = driver.find_element(By.CSS_SELECTOR, "input[type='submit']")
+                search_btn.click()
                 time.sleep(5)
+                try:
+                    WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "li[id^='sogou_vr_']"))
+                    )
+                except TimeoutException:
+                    time.sleep(3)
+        except Exception as exc:
+            print(f"[browser_fetcher] 搜索失败: {exc}")
+            try:
+                driver.get("https://weixin.sogou.com/")
+                time.sleep(3)
             except TimeoutException:
                 pass
 
-        page_source = driver.page_source
+        # Step 2: 翻页抓取
+        page_num = 0
+        max_pages = 3  # 最多翻 3 页
 
-        if _is_antispider(page_source):
-            print(f"[browser_fetcher] 搜狗返回验证码页，跳过")
-            return articles
+        while len(articles) < max_articles and page_num < max_pages:
+            page_num += 1
+            page_source = driver.page_source
 
-        # 解析搜索结果块
-        blocks = re.findall(
-            r'(<li id="sogou_vr_11002601_box_\d+".*?</li>)',
-            page_source, flags=re.S,
-        )
+            # 检测真正的反爬拦截页面
+            if _is_antispider(page_source):
+                print(f"[browser_fetcher] 搜狗触发反爬验证（第{page_num}页），停止翻页")
+                break
 
-        if not blocks:
-            # 尝试更宽松的匹配
+            # 解析搜索结果块
             blocks = re.findall(
-                r'<li[^>]*id="sogou_vr_11002601_box_\d+"[^>]*>.*?</li>',
+                r'(<li id="sogou_vr_11002601_box_\d+".*?</li>)',
                 page_source, flags=re.S,
             )
 
-        if not blocks:
-            print(f"[browser_fetcher] 搜狗搜索无结果 (query={search_query[:40]}), page_len={len(page_source)})")
+            if not blocks:
+                # 尝试更宽松的匹配
+                blocks = re.findall(
+                    r'<li[^>]*id="sogou_vr_11002601_box_\d+"[^>]*>.*?</li>',
+                    page_source, flags=re.S,
+                )
 
-        for block in blocks:
-            if len(articles) >= max_articles:
+            if not blocks:
+                # 调试：打印页面中所有 li 标签的 id 属性，帮助诊断 DOM 结构变化
+                li_ids = re.findall(r'<li[^>]*id="([^"]*)"', page_source)
+                sample_ids = li_ids[:10] if li_ids else ['(无li标签)']
+                print(f"[browser_fetcher] 搜狗第{page_num}页无结果 (query={search_query[:40]}, page_len={len(page_source)}, li_ids={sample_ids})")
                 break
 
-            title_match = re.search(
-                r'id="sogou_vr_11002601_title_\d+"[^>]*>(.*?)</a>',
-                block, re.S,
-            )
-            href_match = re.search(r'href="(/link\?url=[^"]+)"', block, re.S)
-            summary_match = re.search(
-                r'<p class="txt-info"[^>]*>(.*?)</p>', block, re.S,
-            )
+            print(f"[browser_fetcher] 搜狗第{page_num}页: {len(blocks)} 条结果")
 
-            if not title_match or not href_match:
-                continue
+            for block in blocks:
+                if len(articles) >= max_articles:
+                    break
 
-            title = _clean_html(title_match.group(1))[:80]
-            sogou_url = "https://weixin.sogou.com" + href_match.group(1)
-            snippet = _clean_html(summary_match.group(1))[:200] if summary_match else ""
-            published_at = _extract_publish_time(page_source, block)
+                title_match = re.search(
+                    r'id="sogou_vr_11002601_title_\d+"[^>]*>(.*?)</a>',
+                    block, re.S,
+                )
+                href_match = re.search(r'href="(/link\?url=[^"]+)"', block, re.S)
+                summary_match = re.search(
+                    r'<p class="txt-info"[^>]*>(.*?)</p>', block, re.S,
+                )
 
-            # Step 2: 在同一 session 中解析真实微信 URL
-            try:
-                driver.get(sogou_url)
-                time.sleep(2)
-                real_url = driver.current_url
-            except Exception:
-                continue
+                if not title_match or not href_match:
+                    continue
 
-            if "mp.weixin.qq.com" not in real_url:
-                continue
+                title = _clean_html(title_match.group(1))[:80]
+                sogou_url = "https://weixin.sogou.com" + href_match.group(1)
+                snippet = _clean_html(summary_match.group(1))[:200] if summary_match else ""
+                published_at = _extract_publish_time(page_source, block)
 
-            # Step 3: 在同一 session 中抓取文章全文
-            time.sleep(1.5)
-            body = _fetch_article_body(driver)
+                # 解析真实微信 URL 并抓取正文
+                try:
+                    driver.get(sogou_url)
+                    time.sleep(2)
+                    real_url = driver.current_url
+                except Exception:
+                    continue
 
-            if not body or len(body) < 100:
-                continue
+                if "mp.weixin.qq.com" not in real_url:
+                    continue
 
-            articles.append({
-                "title": title,
-                "source": f"{account_name}（微信公众号）",
-                "url": real_url,
-                "sogou_url": sogou_url,
-                "published_at": published_at,
-                "snippet": snippet,
-                "body": body,
-            })
+                # 抓取文章全文
+                time.sleep(1.5)
+                body = _fetch_article_body(driver)
+
+                if not body or len(body) < 100:
+                    continue
+
+                articles.append({
+                    "title": title,
+                    "source": f"{account_name}（微信公众号）",
+                    "url": real_url,
+                    "sogou_url": sogou_url,
+                    "published_at": published_at,
+                    "snippet": snippet,
+                    "body": body,
+                })
+
+            # 翻页：先回到搜索结果页（因为抓正文时 navigate 到了文章页），再点击"下一页"
+            if len(articles) < max_articles:
+                try:
+                    # 回到搜索结果页
+                    driver.back()
+                    time.sleep(1.5)
+                except Exception:
+                    pass
+
+                page_turned = False
+                try:
+                    next_btn = driver.find_element(By.ID, "sogou_next")
+                    if next_btn and next_btn.is_displayed():
+                        next_btn.click()
+                        page_turned = True
+                except Exception:
+                    pass
+
+                if not page_turned:
+                    # 尝试 JS 方式翻页
+                    try:
+                        page_turned = driver.execute_script("""
+                            var next = document.getElementById('sogou_next');
+                            if (next && next.offsetParent !== null) { next.click(); return true; }
+                            // 回退：查找包含"下一页"的链接
+                            var links = document.querySelectorAll('a');
+                            for (var i = 0; i < links.length; i++) {
+                                if (links[i].textContent.indexOf('下一页') >= 0 && links[i].offsetParent !== null) {
+                                    links[i].click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        """)
+                    except Exception:
+                        pass
+
+                if page_turned:
+                    time.sleep(3)
+                else:
+                    print(f"[browser_fetcher] 第{page_num}页无下一页，停止翻页")
+                    break
+
+        # 如果翻页也没拿到结果，说明搜狗完全无结果
 
     except Exception as exc:
         print(f"[browser_fetcher] Error during wechat fetch: {exc}")

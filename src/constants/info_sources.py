@@ -12,7 +12,10 @@
 
 WEB_SOURCES: list[tuple[str, str, str]] = [
     # ("来源名称", "文章列表页URL", "URL匹配pattern"),
-    ("示例技术博客", "https://example.com/articles", "example"),
+    ("机器之心", "https://www.jiqizhixin.com/articles", "jiqizhixin"),
+    ("OpenAI Blog", "https://openai.com/blog/", "openai"),
+    ("Google DeepMind Blog", "https://deepmind.google/discover/blog/", "deepmind"),
+    ("知乎", "https://www.zhihu.com/topic/19550901/hot", "zhihu"),
 ]
 
 # ============================================================
@@ -20,12 +23,12 @@ WEB_SOURCES: list[tuple[str, str, str]] = [
 # ============================================================
 
 WP_API_SOURCES: list[dict] = [
-    # {
-    #     "name": "QbitAI WordPress",
-    #     "url": "https://www.qbitai.com/wp-json/wp/v2/posts?per_page=30&orderby=date&order=desc",
-    #     "display_name": "量子位 / QbitAI",
-    #     "limit": 6,
-    # },
+    {
+        "name": "QbitAI WordPress",
+        "url": "https://www.qbitai.com/wp-json/wp/v2/posts?per_page=30&orderby=date&order=desc",
+        "display_name": "量子位 / QbitAI",
+        "limit": 6,
+    },
 ]
 
 # ============================================================

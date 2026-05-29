@@ -44,7 +44,7 @@
 │  ⑥ 约束与恢复 (Constraint & Recovery)                                │
 │     src/validators/ — 质量门禁：硬性规则校验，不通过即阻断           │
 │       ├─ verify.py           — 日报 JSON 必填字段/格式/URL去重校验   │
-│       ├─ verify_article.py   — Markdown 硬性规则：文件名/字数/禁止词/模板腔│
+│       ├─ verify_article.py   — Markdown 硬性规则：文件名/字数/禁止词  │
 │       └─ verify_consistency.py — 配置一致性检查                     │
 │     agent.py 退化检测 — 连续3轮评分下降 → 提前终止                   │
 │     --overwrite / --skip-fetch — 手动恢复入口                        │
@@ -183,8 +183,8 @@ pipeline.py (③ 执行编排层)
   │     └─ 必填字段、URL 格式、分类完整性
   │
   └─ Stage 3: verify_article.py (⑤+⑥ 成稿质量校验)
-        └─ ⑥ 硬性规则：Markdown 格式、字数、禁止词、模板腔
-        └─ ⑤ 审稿 Agent：5维评分（hook/观点/线索/深度/可读性）
+        └─ ⑥ 硬性规则：Markdown 格式、字数、禁止词
+        └─ ⑤ 审稿 Agent：5维评分（hook/观点/线索/深度/可读性）+ 模板腔检测
               │
               ├─ PASS → 流水线完成
               └─ FAIL → errors/{date}-log.md (⑤ 错误归因)
@@ -317,3 +317,4 @@ WP_API_SOURCES: list[dict] = [
 - **新增 middleware/pipeline_logger.py**：带时间戳的阶段计时日志，同时写控制台+文件
 - **搜狗微信搜索优化**：自动点击"按时间排序"，默认只看当天文章（`--days 1`）
 - **修复 kept_existing 分支**：已有文章时从 article_states 回读真实元数据，避免验证失败
+- **模板化判断 Agent 化**：模板腔规避约束写入写作 prompt，模板腔检测交给审稿 Agent 判断，不再靠硬编码正则替换/匹配

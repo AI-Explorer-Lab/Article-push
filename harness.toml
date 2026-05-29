@@ -3,23 +3,13 @@
 
 [project]
 name = "微信公众号推送-harness"
-description = "微信公众号 AI 技术内容生产 Harness 流水线（v2.4 质量增强版）"
-version = "2.4.0"
+description = "微信公众号 AI 技术内容生产 Harness 流水线（v3.0 Agent 化判断版）"
+version = "3.0.0"
 
 [pipeline]
-# v2.4 流水线参数
-# agent.py 直接抓取 5 篇候选（GitHub 最多 2，其他至少 3）
-# writer 直接从 report JSON 读取，内嵌类型推断和路径生成（无 deepread 中间层）
-# v2.4 质量增强：
-#   - summary: LLM 生成 80-120 字中文摘要（替代截断前100字符）
-#   - insight: LLM 基于原文生成独立判断（替代硬编码模板）
-#   - classify: LLM 语义分类（替代关键词匹配）
-#   - writer prompt: 精简指令，减少模板腔引导
-#   - polish: 不再粗暴删除正常连接词
-# 审稿修订循环（最多 N 轮，门槛 65 分）：
-#   - 逐轮调整修改策略：温和 → 强化 → 强力重构
-#   - 退化检测：评分连续 3 轮下降 → 提前终止
-#   - 每篇文章独立追踪评分历史
+# v3.0 流水线参数
+# agent.py 逐条全链路处理（抓取→阅读→写作→审稿→保存）
+# 模板腔规避和检测已交给 Agent 判断，不再靠硬编码正则
 default_days = 10
 target_article_count = 5
 max_github = 2

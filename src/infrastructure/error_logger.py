@@ -62,7 +62,7 @@ _KNOWN_PATTERNS: list[tuple[str, str]] = [
     ),
     (
         r"编辑评分低于发布门槛",
-        "成稿验证分数低于 75 时，不进入发布态，先按 verify_article.py 的 rewrite_suggestions 润色。",
+        "成稿验证分数低于 65 时，不进入发布态，先按 verify_article.py 的 rewrite_suggestions 润色。",
     ),
 ]
 
@@ -94,7 +94,7 @@ def _build_failure_text(results: list[StageResult]) -> str:
 _ANALYSIS_SYSTEM_PROMPT = """你是一个 Harness 流水线的故障分析 Agent。你的任务是根据流水线失败日志，分析出可能的根因，并给出「建议沉淀的规则」。
 
 背景：这是一个微信公众号 AI 技术内容生产流水线，流程为：
-1. agent.py 抓取候选文章 → 2. 验证基础日报 → 3. deepread 选题 → 4. writer 生成 MD 文章 → 5. 审稿 Agent 评审 → 6. 逐篇验证
+1. agent.py 抓取候选并逐篇生成文章（抓取→阅读→写作→审稿→保存） → 2. 验证基础日报 → 3. 逐篇验证 MD 成稿
 
 你需要：
 1. 从失败日志中提取关键错误信息
