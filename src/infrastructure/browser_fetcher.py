@@ -512,34 +512,34 @@ def fetch_wechat_source_full(
             except TimeoutException:
                 pass
 
-        # Step 2: 翻页抓取
-        page_num = 0
-        max_pages = 3  # 最多翻 3 页
+        # Step 2: 分两阶段处理 ——
+        # 阶段 A: 翻页收集所有搜索结果的链接和元数据（不抓正文，避免 navigate 破坏翻页状态）
+        # 阶段 B: 统一逐篇抓取正文
 
-        while len(articles) < max_articles and page_num < max_pages:
+        page_num = 0
+        max_pages = 5  # 最多翻 5 页收集链接
+
+        # 阶段 A: 收集链接
+        candidate_metas: list[dict] = []  # {title, sogou_url, snippet, published_at}
+        while page_num < max_pages:
             page_num += 1
             page_source = driver.page_source
 
-            # 检测真正的反爬拦截页面
             if _is_antispider(page_source):
                 print(f"[browser_fetcher] 搜狗触发反爬验证（第{page_num}页），停止翻页")
                 break
 
-            # 解析搜索结果块
             blocks = re.findall(
                 r'(<li id="sogou_vr_11002601_box_\d+".*?</li>)',
                 page_source, flags=re.S,
             )
-
             if not blocks:
-                # 尝试更宽松的匹配
                 blocks = re.findall(
                     r'<li[^>]*id="sogou_vr_11002601_box_\d+"[^>]*>.*?</li>',
                     page_source, flags=re.S,
                 )
 
             if not blocks:
-                # 调试：打印页面中所有 li 标签的 id 属性，帮助诊断 DOM 结构变化
                 li_ids = re.findall(r'<li[^>]*id="([^"]*)"', page_source)
                 sample_ids = li_ids[:10] if li_ids else ['(无li标签)']
                 print(f"[browser_fetcher] 搜狗第{page_num}页无结果 (query={search_query[:40]}, page_len={len(page_source)}, li_ids={sample_ids})")
@@ -548,9 +548,6 @@ def fetch_wechat_source_full(
             print(f"[browser_fetcher] 搜狗第{page_num}页: {len(blocks)} 条结果")
 
             for block in blocks:
-                if len(articles) >= max_articles:
-                    break
-
                 title_match = re.search(
                     r'id="sogou_vr_11002601_title_\d+"[^>]*>(.*?)</a>',
                     block, re.S,
@@ -559,87 +556,87 @@ def fetch_wechat_source_full(
                 summary_match = re.search(
                     r'<p class="txt-info"[^>]*>(.*?)</p>', block, re.S,
                 )
-
                 if not title_match or not href_match:
                     continue
 
-                title = _clean_html(title_match.group(1))[:80]
-                sogou_url = "https://weixin.sogou.com" + href_match.group(1)
-                snippet = _clean_html(summary_match.group(1))[:200] if summary_match else ""
-                published_at = _extract_publish_time(page_source, block)
-
-                # 解析真实微信 URL 并抓取正文
-                try:
-                    driver.get(sogou_url)
-                    time.sleep(2)
-                    real_url = driver.current_url
-                except Exception:
-                    continue
-
-                if "mp.weixin.qq.com" not in real_url:
-                    continue
-
-                # 抓取文章全文
-                time.sleep(1.5)
-                body = _fetch_article_body(driver)
-
-                if not body or len(body) < 100:
-                    continue
-
-                articles.append({
-                    "title": title,
-                    "source": f"{account_name}（微信公众号）",
-                    "url": real_url,
-                    "sogou_url": sogou_url,
-                    "published_at": published_at,
-                    "snippet": snippet,
-                    "body": body,
+                candidate_metas.append({
+                    "title": _clean_html(title_match.group(1))[:80],
+                    "sogou_url": "https://weixin.sogou.com" + href_match.group(1),
+                    "snippet": _clean_html(summary_match.group(1))[:200] if summary_match else "",
+                    "published_at": _extract_publish_time(page_source, block),
                 })
 
-            # 翻页：先回到搜索结果页（因为抓正文时 navigate 到了文章页），再点击"下一页"
-            if len(articles) < max_articles:
-                try:
-                    # 回到搜索结果页
-                    driver.back()
-                    time.sleep(1.5)
-                except Exception:
-                    pass
+            # 翻到下一页（仍在搜索结果页，不会 navigate 走）
+            page_turned = False
+            try:
+                next_btn = driver.find_element(By.ID, "sogou_next")
+                if next_btn and next_btn.is_displayed():
+                    next_btn.click()
+                    page_turned = True
+            except Exception:
+                pass
 
-                page_turned = False
+            if not page_turned:
                 try:
-                    next_btn = driver.find_element(By.ID, "sogou_next")
-                    if next_btn and next_btn.is_displayed():
-                        next_btn.click()
-                        page_turned = True
-                except Exception:
-                    pass
-
-                if not page_turned:
-                    # 尝试 JS 方式翻页
-                    try:
-                        page_turned = driver.execute_script("""
-                            var next = document.getElementById('sogou_next');
-                            if (next && next.offsetParent !== null) { next.click(); return true; }
-                            // 回退：查找包含"下一页"的链接
-                            var links = document.querySelectorAll('a');
-                            for (var i = 0; i < links.length; i++) {
-                                if (links[i].textContent.indexOf('下一页') >= 0 && links[i].offsetParent !== null) {
-                                    links[i].click();
-                                    return true;
-                                }
+                    page_turned = driver.execute_script("""
+                        var next = document.getElementById('sogou_next');
+                        if (next && next.offsetParent !== null) { next.click(); return true; }
+                        var links = document.querySelectorAll('a');
+                        for (var i = 0; i < links.length; i++) {
+                            if (links[i].textContent.indexOf('下一页') >= 0 && links[i].offsetParent !== null) {
+                                links[i].click(); return true;
                             }
-                            return false;
-                        """)
-                    except Exception:
-                        pass
+                        }
+                        return false;
+                    """)
+                except Exception:
+                    pass
 
-                if page_turned:
-                    time.sleep(3)
-                else:
-                    print(f"[browser_fetcher] 第{page_num}页无下一页，停止翻页")
-                    break
+            if page_turned:
+                time.sleep(3)
+            else:
+                print(f"[browser_fetcher] 第{page_num}页无下一页，停止翻页")
+                break
 
-        # 如果翻页也没拿到结果，说明搜狗完全无结果
+        print(f"[browser_fetcher] 阶段A完成: 共收集 {len(candidate_metas)} 个候选链接 (翻{page_num}页)")
+
+        # 搜狗默认按相关性排序，不是按时间倒序。将候选按发布日期倒序排列，
+        # 确保阶段 B 优先抓取最新文章，避免新文章因排在后面而被 max_articles 截断。
+        candidate_metas.sort(
+            key=lambda m: m.get("published_at", ""),
+            reverse=True,
+        )
+
+        # 阶段 B: 逐篇抓取正文
+        for meta in candidate_metas:
+            if len(articles) >= max_articles:
+                break
+
+            try:
+                driver.get(meta["sogou_url"])
+                time.sleep(2)
+                real_url = driver.current_url
+            except Exception:
+                continue
+
+            if "mp.weixin.qq.com" not in real_url:
+                continue
+
+            time.sleep(1.5)
+            body = _fetch_article_body(driver)
+
+            if not body or len(body) < 100:
+                continue
+
+            articles.append({
+                "title": meta["title"],
+                "source": f"{account_name}（微信公众号）",
+                "url": real_url,
+                "sogou_url": meta["sogou_url"],
+                "published_at": meta["published_at"],
+                "snippet": meta["snippet"],
+                "body": body,
+            })
 
     except Exception as exc:
         print(f"[browser_fetcher] Error during wechat fetch: {exc}")

@@ -195,7 +195,7 @@ def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog], days
         articles = fetch_wechat_source_full(
             account_name=account_name,
             query=query,
-            max_articles=15,  # 翻页抓取更多，由 agent.py 日期过滤筛选当日文章
+            max_articles=30,  # 搜狗排序不一定按时间倒序，多抓一些由日期过滤筛选
             headless=True,
             days=days,
         )
