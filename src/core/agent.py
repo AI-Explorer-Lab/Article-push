@@ -19,8 +19,8 @@
 - 模板腔规避和检测已交给 Agent，不再靠硬编码正则替换/匹配
 
 微信公众号抓取策略：
-- 优先使用 Selenium + Chrome 无头浏览器（可绕过搜狗反爬）
-- Selenium 不可用时回退到 urllib（但成功率低）
+- 使用 Mac 微信前台短接管采集公众号主页文章 URL
+- URL 获取后交给后台正文抓取逻辑处理
 """
 
 from __future__ import annotations
@@ -37,8 +37,15 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urljoin
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 
 # ---------------------------------------------------------------------------
 # 关注领域及其关键词映射（需与 AGENT.md 保持一致）
@@ -71,9 +78,9 @@ FOCUS_TOPICS: dict[str, list[str]] = {
     ],
 }
 
-# 微信公众号来源（通过搜狗微信搜索）
+# 微信公众号来源（通过 Mac 微信前台短接管采集 URL）
 # 配置在 src/constants/wechat_sources.py 中，此处从常量模块导入
-from src.constants.wechat_sources import WECHAT_SOURCES, WECHAT_ACCOUNT_IDS
+from src.constants.wechat_sources import WECHAT_SOURCES, WECHAT_SOURCE_ACCOUNTS
 from src.constants.info_sources import (
     INSIGHTS,
     get_web_sources,
@@ -151,292 +158,90 @@ def clean_text(value: str) -> str:
     return value.strip()
 
 
-def parse_sogou_date(block: str) -> str | None:
-    """从搜狗微信搜索结果块中提取日期。"""
-    match = re.search(r"(\d{4}-\d{2}-\d{2})", block)
-    if match:
-        return match.group(1)
-    return None
-
-
-def is_sogou_antispider_page(html_text: str) -> bool:
-    lowered = html_text.lower()
-    return any(token in lowered for token in ("antispider", "verify", "imgcode", "captcha"))
-
-
-def normalize_sogou_link(href: str) -> str:
-    from html import unescape
-    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
-    absolute = urljoin("https://weixin.sogou.com/", unescape(href))
-    parts = urlsplit(absolute)
-    query = urlencode(parse_qsl(parts.query, keep_blank_values=True))
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
-
-
 # ---------------------------------------------------------------------------
 # 抓取函数
 # ---------------------------------------------------------------------------
 
-def fetch_sogou_wechat(account_name: str, query: str, logs: list[FetchLog], days: int = 7) -> list[Candidate]:
-    """通过 Selenium 浏览器抓取搜狗微信搜索的文章。
+def fetch_wechat_foreground(
+    account_name: str,
+    query: str,
+    logs: list[FetchLog],
+    days: int = 7,
+    target_date: str | date | None = None,
+    prompt_user: bool = True,
+) -> list[Candidate]:
+    """通过 Mac 微信前台短接管采集公众号文章 URL。
 
-    优先使用 Selenium + Chrome 无头浏览器（绕过反爬），
-    失败时回退到传统 urllib 方式（成功率低）。
-
-    自动过滤超出 days 回溯窗口的旧文章。
+    旧搜狗/普通浏览器自动化在日期筛选和反爬上不稳定。这里改为
+    使用已验证的本机微信路径：搜索公众号 → 进入主页 → 识别日期分组 →
+    打开文章 → 复制 mp.weixin.qq.com URL。
     """
-    cutoff_date = (datetime.now() - timedelta(days=days)).date()
-    candidates: list[Candidate] = []
-
-    # 策略 1: Selenium 浏览器抓取（推荐）
     try:
-        from src.infrastructure.browser_fetcher import fetch_wechat_source_full
-        print(f"    启动 Selenium 浏览器抓取...")
+        if isinstance(target_date, date):
+            end_date = target_date
+        else:
+            end_date = datetime.strptime(target_date, "%Y-%m-%d").date() if target_date else date.today()
+    except ValueError:
+        end_date = date.today()
+    # 日期窗口由微信主页分组识别承担。
+
+    try:
+        from src.infrastructure.wechat_foreground_collector import collect_wechat_article_urls
+
+        max_articles = int(os.getenv("WECHAT_FOREGROUND_MAX_ARTICLES", "3"))
+        search_names = list(dict.fromkeys([account_name, *WECHAT_SOURCE_ACCOUNTS.get(account_name, [])]))
+        print("    启动微信前台短接管采集 URL...")
         sys.stdout.flush()
-        articles = fetch_wechat_source_full(
-            account_name=account_name,
-            query=query,
-            max_articles=30,  # 搜狗排序不一定按时间倒序，多抓一些由日期过滤筛选
-            headless=True,
-            days=days,
-        )
-        print(f"    Selenium 返回 {len(articles)} 篇")
+        articles = []
+        errors: list[str] = []
+        for idx, search_name in enumerate(search_names):
+            try:
+                articles = collect_wechat_article_urls(
+                    account_name=search_name,
+                    max_articles=max_articles,
+                    days=days,
+                    target_date=end_date,
+                    prompt_user=prompt_user and idx == 0,
+                )
+            except Exception as exc:
+                errors.append(f"{search_name}: {exc}")
+                articles = []
+            if articles:
+                break
+        if not articles and errors:
+            raise RuntimeError("; ".join(errors))
+        candidates: list[Candidate] = []
         for article in articles:
-            published_at = article.get("published_at", "")
-            # 日期过滤：只保留 days 天内的文章
-            if published_at:
-                try:
-                    pub_date = datetime.strptime(published_at, "%Y-%m-%d").date()
-                    if pub_date < cutoff_date:
-                        print(f"  [FILTER] 过期文章（{published_at}），跳过: {article['title'][:40]}...")
-                        continue
-                except ValueError:
-                    pass
             candidates.append(
                 Candidate(
-                    title=article["title"],
-                    source=article["source"],
-                    url=article["url"],
-                    published_at=published_at,
-                    snippet=article.get("snippet", ""),
-                    body=article.get("body", ""),
+                    title=article.title,
+                    source=f"{account_name}（微信公众号）",
+                    url=article.url,
+                    published_at=article.published_at,
+                    snippet=article.snippet,
                 )
             )
             logs.append(
                 FetchLog(
                     source=account_name,
-                    url=article["url"],
+                    url=article.url,
                     ok=True,
-                    detail=f"Selenium: title={article['title'][:40]}, body={len(article.get('body', ''))} chars",
+                    detail=f"微信前台采集: title={article.title[:40]}",
                 )
             )
-        if candidates:
-            return candidates
+        print(f"    微信前台采集返回 {len(candidates)} 篇")
+        return candidates
     except Exception as exc:
         logs.append(
             FetchLog(
                 source=account_name,
-                url="Selenium browser",
+                url="WeChat foreground collector",
                 ok=False,
-                detail=f"Selenium failed: {exc}, falling back to urllib",
+                detail=f"微信前台采集失败: {exc}",
             )
         )
-
-    # 策略 2: 回退到 urllib + 搜索引擎（旧方案，成功率低）
-    return _fetch_sogou_wechat_urllib(account_name, query, logs)
-
-
-def _fetch_sogou_wechat_urllib(account_name: str, query: str, logs: list[FetchLog]) -> list[Candidate]:
-    """旧版 urllib 抓取方案（回退策略）。
-
-    搜狗微信搜索已改为 JS 动态加载，纯 HTTP 抓取无法获取完整结果。
-    因此改用替代策略：通过搜索引擎搜索 mp.weixin.qq.com 上的文章。
-    """
-    candidates: list[Candidate] = []
-
-    # 策略 A: 直接搜 mp.weixin.qq.com + 公众号名（通过搜狗通用搜索）
-    search_queries = [
-        f"site:mp.weixin.qq.com {account_name} AI",
-        f"{account_name} 公众号 mp.weixin.qq.com",
-    ]
-
-    for q in search_queries:
-        if len(candidates) >= 3:
-            break
-        search_url = f"https://www.sogou.com/web?query={quote(q)}"
-        try:
-            html_text = fetch_text(search_url, timeout=20)
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-            logs.append(FetchLog(source=account_name, url=search_url, ok=False, detail=str(exc)))
-            continue
-        if is_sogou_antispider_page(html_text):
-            logs.append(
-                FetchLog(
-                    source=account_name,
-                    url=search_url,
-                    ok=False,
-                    detail="Sogou anti-spider verification page",
-                )
-            )
-            continue
-
-        wechat_urls = re.findall(
-            r'https?://mp\.weixin\.qq\.com/s/[^"&\s]+',
-            html_text,
-        )
-        seen_urls: set[str] = set()
-        for url in wechat_urls[:5]:
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-
-            idx = html_text.find(url)
-            context_block = html_text[max(0, idx - 500):idx + 200]
-            title = ""
-            for pattern in [
-                r'<a[^>]*>\s*<em>(.*?)</em>',
-                r'title="([^"]*)"',
-                r'<h3[^>]*>(.*?)</h3>',
-                r'>([^<]{10,80})<',
-            ]:
-                title_match = re.search(pattern, context_block, re.S)
-                if title_match:
-                    title = clean_text(title_match.group(1))[:80]
-                    if len(title) >= 5:
-                        break
-
-            if not title or len(title) < 3:
-                title = f"{account_name} 文章"
-
-            pub_date = parse_sogou_date(context_block) or ""
-
-            candidates.append(
-                Candidate(
-                    title=title,
-                    source=f"{account_name}（微信公众号）",
-                    url=url,
-                    published_at=pub_date,
-                    snippet=clean_text(context_block)[:200],
-                )
-            )
-            logs.append(FetchLog(source=account_name, url=url, ok=True, detail=f"urllib: title={title[:40]}"))
-
-    # 策略 B: Bing 搜索
-    if not candidates:
-        try:
-            bing_url = f"https://www.bing.com/search?q=site:mp.weixin.qq.com+{quote(account_name)}+AI&count=5"
-            html_text = fetch_text(bing_url, timeout=20)
-            wechat_urls = re.findall(
-                r'https?://mp\.weixin\.qq\.com/s/[^"&\s]+',
-                html_text,
-            )
-            seen_urls: set[str] = set()
-            for url in wechat_urls[:5]:
-                if url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                idx = html_text.find(url)
-                context_block = html_text[max(0, idx - 300):idx + 200]
-                title_match = re.search(r'<h2[^>]*>(.*?)</h2>', context_block, re.S)
-                title = clean_text(title_match.group(1)) if title_match else f"{account_name} 文章"
-                candidates.append(
-                    Candidate(
-                        title=title[:80],
-                        source=f"{account_name}（微信公众号）",
-                        url=url,
-                        snippet=clean_text(context_block)[:200],
-                    )
-                )
-            logs.append(FetchLog(source=account_name, url=bing_url, ok=True, detail=f"Bing found {len(candidates)} articles"))
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-            logs.append(FetchLog(source=account_name, url="bing search", ok=False, detail=str(exc)))
-
-    return candidates
-
-
-def fetch_sogou_wechat_legacy(account_name: str, query: str, logs: list[FetchLog]) -> list[Candidate]:
-    """使用搜狗微信老入口 weixin.sogou.com/weixin?type=2 抓取文章。"""
-    candidates: list[Candidate] = []
-    search_query = f"{account_name} {query} MCP 2026"
-    search_url = f"https://weixin.sogou.com/weixin?type=2&query={quote(search_query)}"
-    try:
-        html_text = fetch_text(search_url, timeout=20)
-    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-        logs.append(FetchLog(source=f"Sogou WeChat: {account_name}", url=search_url, ok=False, detail=str(exc)))
-        return candidates
-
-    if is_sogou_antispider_page(html_text):
-        logs.append(
-            FetchLog(
-                source=f"Sogou WeChat: {account_name}",
-                url=search_url,
-                ok=False,
-                detail="Sogou anti-spider verification page",
-            )
-        )
-        return candidates
-
-    blocks = re.findall(
-        r'(<li id="sogou_vr_11002601_box_\d+".*?</li>)',
-        html_text,
-        flags=re.S,
-    )
-    skipped_no_date = 0
-    for block in blocks:
-        title_match = re.search(r'id="sogou_vr_11002601_title_\d+"[^>]*>(.*?)</a>', block, re.S)
-        # href 可能在 id 前面或后面，用更宽松的匹配
-        href_match = re.search(r'href="(/link\?url=[^"]+)"', block, re.S)
-        summary_match = re.search(r'<p class="txt-info"[^>]*>(.*?)</p>', block, re.S)
-
-        if not title_match or not href_match:
-            continue
-
-        # 搜狗新格式: timeConvert('1771042006') 单引号
-        block_start = html_text.find(block)
-        surrounding = html_text[block_start:block_start + 5000]
-        ts_match = re.search(r"timeConvert\(\s*['\"]?(?P<ts>\d{10})", surrounding)
-        if ts_match:
-            published_at = datetime.fromtimestamp(int(ts_match.group("ts"))).strftime("%Y-%m-%d")
-        else:
-            # 从标题和摘要中尝试提取中文日期格式
-            combined = clean_text(title_match.group(1)) + " " + clean_text(summary_match.group(1) if summary_match else "")
-            date_match = re.search(r"(\d{4})[\u5e74\-\/](\d{1,2})[\u6708\-\/](\d{1,2})[\u65e5]?", combined)
-            if date_match:
-                published_at = f"{date_match.group(1)}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
-            else:
-                # 只匹配年份的宽松策略
-                year_match = re.search(r"(\d{4})[\u5e74]", combined)
-                if year_match:
-                    published_at = f"{year_match.group(1)}-01-01"
-                else:
-                    skipped_no_date += 1
-                    continue
-
-        title = clean_text(title_match.group(1))[:80] or f"{account_name} 文章"
-        snippet = clean_text(summary_match.group(1))[:200] if summary_match else ""
-        candidates.append(
-            Candidate(
-                title=title,
-                source=f"{account_name}（微信公众号）",
-                url=normalize_sogou_link(href_match.group(1)),
-                published_at=published_at,
-                snippet=snippet,
-            )
-        )
-        if len(candidates) >= 5:
-            break
-
-    logs.append(
-        FetchLog(
-            source=f"Sogou WeChat: {account_name}",
-            url=search_url,
-            ok=True,
-            detail=f"{len(blocks)} result blocks, kept {len(candidates)}, skipped_no_date {skipped_no_date}",
-        )
-    )
-    return candidates
-
+        print(f"  [WARN] 微信前台采集失败: {exc}")
+        return []
 
 def fetch_wp_api_sources(days: int, logs: list[FetchLog]) -> list[Candidate]:
     """从 WordPress API 源抓取文章（如 QbitAI 等）。"""
@@ -708,25 +513,31 @@ def normalize_title(title: str) -> str:
 # 主流程：抓取 + 逐篇评估 + 生成
 # ---------------------------------------------------------------------------
 
-def collect_candidates(days: int, logs: list[FetchLog]) -> list[Candidate]:
+def collect_candidates(days: int, logs: list[FetchLog], report_date: str | None = None) -> list[Candidate]:
     """收集所有候选文章。
 
     抓取策略：
-    - 微信公众号（通过搜索引擎搜索 mp.weixin.qq.com）
-      注意：搜狗微信搜索已改为 JS 动态加载，纯 HTTP 抓取可能获取不到结果。
-      此时系统会从其他来源补足。
+    - 微信公众号：Mac 微信前台短接管采集真实文章 URL
+      注意：这一阶段需要微信在前台，采集到 URL 后正文抓取会回到后台处理。
     - GitHub 最多 2 篇
     - 网页信息源（配置在 src/constants/info_sources.py）
     - WordPress API 源（配置在 src/constants/info_sources.py）
     """
     all_candidates: list[Candidate] = []
 
-    # 1. 微信公众号（通过 Selenium 浏览器抓取搜狗微信搜索，失败时回退 urllib）
+    # 1. 微信公众号（通过 Mac 微信前台短接管采集 URL）
     wechat_count = len(WECHAT_SOURCES)
     for i, (account_name, query) in enumerate(WECHAT_SOURCES, 1):
         print(f"[FETCH] [{i}/{wechat_count}] 抓取微信公众号: {account_name}...")
         sys.stdout.flush()
-        wechat_candidates = fetch_sogou_wechat(account_name, query, logs, days=days)
+        wechat_candidates = fetch_wechat_foreground(
+            account_name,
+            query,
+            logs,
+            days=days,
+            target_date=report_date,
+            prompt_user=(i == 1),
+        )
         all_candidates.extend(wechat_candidates)
         print(f"[FETCH]   → {account_name}: {len(wechat_candidates)} 篇")
         sys.stdout.flush()
@@ -1463,7 +1274,7 @@ def run_full_pipeline(report_date: str, days: int) -> dict:
     import os as _os
 
     logs: list[FetchLog] = []
-    candidates = collect_candidates(days, logs)
+    candidates = collect_candidates(days, logs, report_date=report_date)
 
     print(f"\n{'='*60}")
     print(f"Pipeline: {report_date} (逐条全链路模式)")
@@ -1494,17 +1305,14 @@ def run_full_pipeline(report_date: str, days: int) -> dict:
         deduped.append(c)
     print(f"去重后剩余 {len(deduped)} 个候选")
 
-    # 选取候选（GitHub 最多 2）
-    github_candidates = [c for c in deduped if source_bucket(c.source) == "GitHub"]
-    non_github = [c for c in deduped if source_bucket(c.source) != "GitHub"]
-    pool: list[Candidate] = []
-    pool.extend(github_candidates[:MAX_GITHUB])
-    pool.extend(non_github[:TARGET_ARTICLES - len(pool)])
-    remaining = [c for c in deduped if c not in pool]
-    while len(pool) < TARGET_ARTICLES and remaining:
-        pool.append(remaining.pop(0))
-    pool = pool[:TARGET_ARTICLES]
-    print(f"候选池 {len(pool)} 篇（GitHub: {len([c for c in pool if source_bucket(c.source)=='GitHub'])}）")
+    # 选取候选：不要在质量评估前截断到 TARGET_ARTICLES。
+    # 微信/网页搜索会混入招聘、导航页等噪声；如果先截断，前几篇被
+    # AI 评估跳过后，后面的高质量候选就永远不会被尝试。
+    pool = deduped
+    print(
+        f"候选池 {len(pool)} 篇（GitHub 可用: "
+        f"{len([c for c in pool if source_bucket(c.source)=='GitHub'])}，最多处理 {MAX_GITHUB} 篇）"
+    )
 
     # ---- 逐条处理 ----
     # 初始化 LLM providers
@@ -1549,7 +1357,11 @@ def run_full_pipeline(report_date: str, days: int) -> dict:
     print(f"开始逐条处理（最多 {review_max_rounds} 轮审稿，通过门槛 {review_pass_score} 分）")
     print(f"{'='*60}")
 
-    for i, candidate in enumerate(pool):
+    for i, candidate in enumerate(pool, 1):
+        if processed_count >= TARGET_ARTICLES:
+            print(f"\n  [DONE] 已产出目标篇数 {TARGET_ARTICLES}，停止继续处理候选")
+            break
+
         is_github = source_bucket(candidate.source) == "GitHub"
 
         if is_github and github_count >= MAX_GITHUB:

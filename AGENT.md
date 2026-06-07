@@ -21,7 +21,7 @@
 
 ## 信息源
 优先搜索以下来源：
-- 微信公众号（通过搜狗微信搜索）：配置在 `src/constants/wechat_sources.py` 中
+- 微信公众号（通过 Mac 微信前台短接管采集 URL）：配置在 `src/constants/wechat_sources.py` 中
 - GitHub Trending/Search：AI 相关热门仓库（最多 2 篇）
 - 网页信息源：配置在 `src/constants/info_sources.py` 中
 - WordPress API 源：配置在 `src/constants/info_sources.py` 中
@@ -150,6 +150,6 @@ python -m src.core.pipeline --date YYYY-MM-DD
 ## 已知陷阱
 - 不要收录纯营销或广告内容
 - 不要编造 URL
-- 搜狗微信搜索结果必须解析发布时间
+- 微信公众号文章必须从真实 `mp.weixin.qq.com` URL 抓取，并记录可验证发布时间
 - Anthropic News 不再抓取
 - 输出必须是合法 JSON

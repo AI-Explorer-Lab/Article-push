@@ -17,7 +17,8 @@
 │     src/core/agent.py — 逐篇处理时保留原文上下文，审稿通过后才丢弃     │
 ├─────────────────────────────────────────────────────────────────────┤
 │  ② 工具系统 (Tool System)                                           │
-│     src/infrastructure/browser_fetcher.py — Selenium 搜狗微信搜索    │
+│     src/infrastructure/wechat_foreground_collector.py — 微信前台采集 URL│
+│     src/infrastructure/browser_fetcher.py — 微信正文抓取与旧浏览器工具 │
 │     src/infrastructure/llm_client.py — LLM API 封装（写作/审稿/分析） │
 │     src/common/utils.py — URL 清洗、JSON 读写、文本处理等工具函数     │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -56,7 +57,7 @@
 | # | Harness 组件 | 核心文件 | 职责 |
 |---|-------------|---------|------|
 | ① | **上下文精细化** | `AGENT.md` + `harness.toml` + `context.py` + `agent.py` | 规则契约定义、结构化配置、原文事实提取、上下文窗口管理 |
-| ② | **工具系统** | `browser_fetcher.py` + `llm_client.py` + `utils.py` | 浏览器搜索抓取、LLM API 调用、通用工具函数 |
+| ② | **工具系统** | `wechat_foreground_collector.py` + `browser_fetcher.py` + `llm_client.py` + `utils.py` | 微信前台 URL 采集、微信正文抓取、LLM API 调用、通用工具函数 |
 | ③ | **执行编排** | `pipeline.py` + `agent.py` | 三阶段流水线编排、全链路 Worker 执行 |
 | ④ | **记忆与状态** | `states/` + `reports/` + agent 内存 | 运行状态持久化、日报数据存储、审稿期间上下文记忆 |
 | ⑤ | **评估与观测** | `pipeline_logger.py` + `verify_article.py`(审稿Agent) + `error_logger.py` | 阶段计时日志、5维审稿评分、错误智能归因 |
@@ -80,7 +81,8 @@ src/
 │
 ├── infrastructure/                 # 基础设施 — ② 工具系统
 │   ├── llm_client.py               # LLM API 调用封装（写作/审稿/日志分析）
-│   ├── browser_fetcher.py          # Selenium 浏览器抓取（搜狗微信搜索）
+│   ├── browser_fetcher.py          # 微信正文抓取与旧浏览器抓取工具
+│   ├── wechat_foreground_collector.py # Mac 微信前台短接管采集公众号文章 URL
 │   └── error_logger.py             # 错误日志 + 已知坑位匹配 + LLM 智能归因
 │
 ├── core/                           # 核心业务逻辑
@@ -111,7 +113,7 @@ logs/                    # ⑤ Pipeline 运行日志
 
 ### 环境要求
 
-- Python >= 3.11
+- Python >= 3.13
 
 ### 配置环境变量
 
@@ -171,7 +173,7 @@ python -m src.core.pipeline --skip-fetch
 pipeline.py (③ 执行编排层)
   │
   ├─ Stage 1: agent.py (全链路 Worker)
-  │     ├─ ② 浏览器搜狗搜索 / GitHub 抓取候选
+  │     ├─ ② 微信前台短接管采集公众号 URL / GitHub 抓取候选
   │     ├─ ① 逐篇：抓原文 → AI 阅读(上下文精细化) → 质量评估 → 写作
   │     ├─ ⑤ 审稿 Agent 独立评审（5维评分，≥65分通过）
   │     │   └─ 不通过 → 带建议修改 → 再审（最多3轮，逐轮策略升级）
@@ -232,19 +234,29 @@ python -m src.validators.verify_article daily_paper/2026-05-29-01.md --verbose
 
 ## 配置说明
 
-### 微信公众号搜索源配置
+### 微信公众号来源配置
 
 编辑 `src/constants/wechat_sources.py`，填入你要追踪的公众号：
 
 ```python
 WECHAT_SOURCES: list[tuple[str, str]] = [
-    ("你的公众号名称", "搜索关键词"),
+    ("你的公众号名称", ""),
 ]
 
 WECHAT_ACCOUNT_IDS: dict[str, str] = {
-    "你的公众号名称": "",  # Account ID 可选，不知道就留空
+    "你的公众号名称": "",  # 当前前台采集不依赖，保留给兼容逻辑
 }
 ```
+
+微信公众号来源现在使用 Mac 微信前台短接管采集 URL：pipeline 会短暂接管微信，搜索公众号、进入主页、识别 `今天`/`昨天` 等日期分组，打开文章并复制 `mp.weixin.qq.com` URL。拿到 URL 后，正文抓取、清洗、评估和写作继续在后台执行。详细流程见 `docs/wechat_frontstage_url_capture.md`。
+
+相关环境变量：
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `WECHAT_FOREGROUND_MAX_ARTICLES` | 每个公众号最多采集几篇文章 URL | `3` |
+| `WECHAT_FOREGROUND_ASSUME_READY` | 设为 `1` 时跳过前台接管确认提示 | 空 |
+| `WECHAT_FOREGROUND_KEEP_ACCOUNT_WINDOW` | 设为 `1` 时采集后保留公众号窗口；默认关闭窗口以便下一个公众号重新搜索 | 空 |
 
 ### 网页信息源与模板配置
 
@@ -315,6 +327,6 @@ WP_API_SOURCES: list[dict] = [
 - **移除 writer.generate_articles() 调用**：agent.py 自己写文章了
 - **移除审稿修订循环**：agent.py 内置了逐篇审稿→修订→再审的完整流程
 - **新增 middleware/pipeline_logger.py**：带时间戳的阶段计时日志，同时写控制台+文件
-- **搜狗微信搜索优化**：自动点击"按时间排序"，默认只看当天文章（`--days 1`）
+- **微信公众号抓取改造**：从搜狗/浏览器搜索改为 Mac 微信前台短接管采集文章 URL，默认按公众号主页日期分组抓当天文章（`--days 1`）
 - **修复 kept_existing 分支**：已有文章时从 article_states 回读真实元数据，避免验证失败
 - **模板化判断 Agent 化**：模板腔规避约束写入写作 prompt，模板腔检测交给审稿 Agent 判断，不再靠硬编码正则替换/匹配

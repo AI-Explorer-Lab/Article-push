@@ -4,10 +4,11 @@
 
 格式说明：
 - WECHAT_SOURCES: list[tuple[str, str]] — (公众号名称, 搜索关键词)
-  公众号名称用于搜狗微信搜索精确匹配，搜索关键词用于内容筛选
-- WECHAT_ACCOUNT_IDS: dict[str, str] — {公众号名称: 搜狗Account ID}
-  Account ID 可选填，用于搜狗微信搜索的 account_id 精确匹配参数
-  如果不知道 Account ID，留空字符串即可，系统会用公众号名称搜索
+  公众号名称用于 Mac 微信前台搜索并进入公众号主页；搜索关键词保留给后续内容筛选扩展
+- WECHAT_ACCOUNT_IDS: dict[str, str] — {公众号名称: 公众号 ID}
+  目前前台采集不依赖该字段，保留用于兼容旧抓取模块和减少同名误命中
+- WECHAT_SOURCE_ACCOUNTS: dict[str, list[str]] — {公众号名称: 来源账号别名}
+  目前前台采集不依赖该字段，保留用于兼容旧抓取模块和正文噪声/禁止词派生
 - FORBIDDEN_PATTERNS: list[tuple[str, str]] — (模式名, 正则)
   生成的文章中禁止出现这些来源名称，防止搬运腔
 - CONTEXT_NOISE_PATTERNS: list[str] — 正文清洗时要过滤的噪声行
@@ -22,17 +23,24 @@ import re
 # ============================================================
 
 WECHAT_SOURCES: list[tuple[str, str]] = [
-    # ("公众号名称", "搜索关键词") — 搜狗微信搜索直接用公众号名，无需额外关键词
+    # ("公众号名称", "搜索关键词") — 前台采集直接用公众号名搜索；关键词暂保留
     ("ChallengeHub", ""),
     ("量子位", ""),
     ("Ai学习的老章", ""),
 ]
 
 WECHAT_ACCOUNT_IDS: dict[str, str] = {
-    # "公众号名称": "Account ID（可选，不知道就留空）",
+    # "公众号名称": "公众号 ID（当前前台采集不依赖，不知道就留空）",
     "ChallengeHub": "",
     "量子位": "QbitAI",
     "Ai学习的老章": "",
+}
+
+WECHAT_SOURCE_ACCOUNTS: dict[str, list[str]] = {
+    # 来源账号别名。默认可与 WECHAT_SOURCES 的名称相同。
+    "ChallengeHub": ["ChallengeHub"],
+    "量子位": ["量子位"],
+    "Ai学习的老章": ["机器学习算法与Python实战"],
 }
 
 # ============================================================
