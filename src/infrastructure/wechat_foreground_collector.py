@@ -133,9 +133,8 @@ def collect_wechat_article_urls(
             _print_visible_texts(account_name, "not_account_page")
             raise WeChatForegroundError(f"点击后未进入公众号主页: {account_name}")
 
-    _open_full_account_home_from_feed(account_name)
+    _ensure_full_account_home(account_name)
     _debug_capture(account_name, "account_page")
-    _standardize_wechat_windows(account_name)
 
     urls: list[WeChatArticleURL] = []
     visited: set[str] = set()
@@ -180,7 +179,7 @@ def collect_wechat_article_urls(
                 print(f"[wechat_foreground] 未复制到微信文章 URL: {url[:120]}", flush=True)
 
             _return_to_account_page()
-            _open_full_account_home_from_feed(account_name)
+            _ensure_full_account_home(account_name)
             _sleep(1.2, 0.25)
     finally:
         _cleanup_after_account()
@@ -420,20 +419,6 @@ def _open_article_card(article: OCRText) -> None:
     _dismiss_storage_warning()
 
 
-def _wait_for_article_shell(timeout: float = 4.0) -> None:
-    """Wait only until WeChat's web shell/address bar has the article URL."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        texts = _ocr()
-        visible = " | ".join(item.text for item in texts)
-        if "Mac 微信已被锁定" in visible:
-            raise WeChatForegroundError("Mac 微信已被锁定，请先在手机微信顶部状态栏解锁")
-        if "mp.weixin.qq.com" in visible:
-            return
-        _sleep(0.45, 0.08)
-    raise WeChatForegroundError("文章页地址栏未出现 mp.weixin.qq.com")
-
-
 def _paste_text(text: str) -> None:
     escaped = text.replace("\\", "\\\\").replace('"', '\\"')
     _run([
@@ -506,24 +491,31 @@ def _wait_for_account_page(timeout: float = 4.0) -> bool:
 
 def _copy_article_url_from_more_menu() -> str:
     """Use the article window's top-right menu to copy the article link."""
-    _click_norm(0.979, 0.942)
-    _sleep(0.6, 0.1)
-    _debug_capture("article_menu", "opened")
-    print("[wechat_foreground] 复制链接: 菜单已点击，查找复制链接", flush=True)
+    click_points = []
+    more_button = _find_article_more_button()
+    if more_button:
+        click_points.append((more_button.cx, more_button.cy))
+    click_points.extend([(0.979, 0.942), (0.965, 0.942), (0.648, 0.040)])
 
-    copy_item = (
-        _find_menu_text_containing("复制链接")
-        or _find_menu_text_containing("拷贝链接")
-        or _find_menu_text_containing("复制 link")
-    )
-    if not copy_item:
-        print("[wechat_foreground] 复制链接: 菜单中未识别到复制链接", flush=True)
-        return ""
+    for x, y in click_points:
+        _click_norm(x, y)
+        _sleep(0.7, 0.12)
+        _debug_capture("article_menu", "opened")
+        print("[wechat_foreground] 复制链接: 菜单已点击，查找复制链接", flush=True)
 
-    print(f"[wechat_foreground] 复制链接: 点击 {copy_item}", flush=True)
-    _click_norm(copy_item.cx, copy_item.cy)
-    _sleep(1.0, 0.15)
-    return _clipboard().strip()
+        copy_item = (
+            _find_menu_text_containing("复制链接")
+            or _find_menu_text_containing("拷贝链接")
+            or _find_menu_text_containing("复制 link")
+        )
+        if copy_item:
+            print(f"[wechat_foreground] 复制链接: 点击 {copy_item}", flush=True)
+            _click_norm(copy_item.cx, copy_item.cy)
+            _sleep(1.0, 0.15)
+            return _clipboard().strip()
+
+    print("[wechat_foreground] 复制链接: 菜单中未识别到复制链接", flush=True)
+    return ""
 
 
 def _find_article_more_button() -> OCRText | None:
@@ -540,9 +532,8 @@ def _find_article_more_button() -> OCRText | None:
     visible = " | ".join(item.text for item in texts)
     if "微信公众平台" in visible or "写留言" in visible or "听全文" in visible:
         # OCR often misses the tiny article-window "..." button. In the current
-        # Mac WeChat layout it sits at the top-right of the article window,
-        # left of the separate chat window.
-        return OCRText("article_more_fallback", 0.692, 0.895, 0.035, 0.035)
+        # Mac WeChat layout it sits at the far top-right of the article window.
+        return OCRText("article_more_fallback", 0.955, 0.925, 0.045, 0.035)
     return None
 
 
@@ -589,20 +580,25 @@ def _ensure_main_search_visible() -> None:
 
 def _return_to_account_page() -> None:
     """Leave an article page and return to the public-account homepage."""
-    for attempt in range(4):
+    for attempt in range(6):
+        if _looks_like_soso_page():
+            _close_current_window()
+            _sleep(0.9, 0.2)
+            continue
         if _looks_like_account_page():
             return
         if attempt == 0:
-            # WeChat's article webview often ignores Cmd+[. The visible browser
-            # back button is stable in the top-left toolbar.
-            _click_norm(0.075, 0.942)
+            # Prefer closing the current article tab/window. Some article pages
+            # are opened beside an old Soso tab, and browser Back returns to the
+            # Soso tab instead of the account home behind the window.
+            _close_current_window()
         elif attempt == 1:
-            # If back is unavailable, close the current web tab; this returns
-            # to the account window without closing the main WeChat client.
-            _click_norm(0.292, 0.942)
+            _close_current_window()
         else:
             _go_back()
         _sleep(0.9, 0.25)
+    if not _looks_like_account_page():
+        raise WeChatForegroundError("未能从文章页返回公众号主页")
 
 
 def _cleanup_after_account() -> None:
@@ -634,7 +630,7 @@ def _cleanup_after_account() -> None:
 def _looks_like_account_page() -> bool:
     texts = _ocr()
     visible = " | ".join(item.text for item in texts)
-    if "搜一搜" in visible and "账号" in visible and ("AI搜索" in visible or "Al搜索" in visible):
+    if _visible_has_soso_markers(visible):
         return False
     has_account_tab = any(item.text in {"全部", "贴图", "文章", "视频号"} for item in texts)
     menu_labels = {
@@ -643,7 +639,7 @@ def _looks_like_account_page() -> bool:
     }
     has_bottom_menu = sum(
         1 for item in texts
-        if any(label in item.text for label in menu_labels)
+        if item.y < 0.22 and any(label in item.text for label in menu_labels)
     ) >= 2
     has_profile = any(
         "已关注" in item.text
@@ -655,16 +651,42 @@ def _looks_like_account_page() -> bool:
     return (has_account_tab and has_profile) or has_bottom_menu
 
 
-def _open_full_account_home_from_feed(account_name: str) -> None:
-    """Open the account home/profile from the public-account push feed."""
+def _looks_like_full_account_home() -> bool:
     texts = _ocr()
     visible = " | ".join(item.text for item in texts)
-    if (
-        "已关注" in visible
-        and "发消息" in visible
-        and "篇原创内容" in visible
-        and ("全部" in visible or "文章" in visible)
-    ):
+    if _visible_has_soso_markers(visible):
+        return False
+    if "微信公众平台" in visible or "写留言" in visible or "听全文" in visible:
+        return False
+    tab_count = sum(1 for item in texts if item.text.strip() in {"全部", "贴图", "文章", "视频号"})
+    has_profile = any(
+        "已关注" in item.text
+        or "发消息" in item.text
+        or "篇原创内容" in item.text
+        or "个朋友关注" in item.text
+        for item in texts
+    )
+    return tab_count >= 2 and has_profile
+
+
+def _ensure_full_account_home(account_name: str) -> None:
+    """Ensure the current public-account view is the full home/history page."""
+    if _looks_like_full_account_home():
+        return
+    _open_full_account_home_from_feed(account_name)
+    deadline = time.time() + 4.5
+    while time.time() < deadline:
+        if _looks_like_full_account_home():
+            return
+        _sleep(0.45, 0.08)
+    _debug_capture(account_name, "missing_full_account_home")
+    _print_visible_texts(account_name, "missing_full_account_home")
+    raise WeChatForegroundError(f"未能进入公众号完整主页: {account_name}")
+
+
+def _open_full_account_home_from_feed(account_name: str) -> None:
+    """Open the account home/profile from the public-account push feed."""
+    if _looks_like_full_account_home():
         return
     if not _looks_like_account_page():
         return
@@ -672,9 +694,12 @@ def _open_full_account_home_from_feed(account_name: str) -> None:
     print(f"[wechat_foreground] 进入公众号完整主页: {account_name}", flush=True)
     # In the public-account feed window, the person icon in the upper-right
     # opens the full account home/history page that shows all same-day articles.
-    _click_norm(0.710, 0.835)
-    _sleep(1.8, 0.25)
-    _debug_capture(account_name, "full_account_home_click")
+    for x, y in ((0.710, 0.835), (0.945, 0.895), (0.920, 0.835)):
+        _click_norm(x, y)
+        _sleep(1.5, 0.2)
+        _debug_capture(account_name, "full_account_home_click")
+        if _looks_like_full_account_home():
+            return
 
 
 def _dismiss_storage_warning() -> None:
@@ -827,7 +852,19 @@ def _looks_like_soso_page() -> bool:
     has_tabs = any(item.text in {"账号", "文章", "视频", "百科", "新闻"} for item in texts)
     has_search = any("搜索" in item.text and item.y > 0.75 for item in texts)
     generic_tabs = any(label in visible for label in ("朋友圈", "视频号", "公众号", "小程序"))
-    return (has_tabs and has_search) or ("搜一搜" in visible and has_search and generic_tabs)
+    return (
+        (has_tabs and has_search)
+        or ("搜一搜" in visible and has_search and generic_tabs)
+        or _visible_has_soso_markers(visible)
+    )
+
+
+def _visible_has_soso_markers(visible: str) -> bool:
+    return (
+        "账号" in visible
+        and ("AI搜索" in visible or "Al搜索" in visible)
+        and any(label in visible for label in ("问一问", "划线", "听一听", "直播", "相关搜索"))
+    )
 
 
 def _find_search_popup_query(account_name: str) -> OCRText | None:
@@ -913,7 +950,7 @@ def _find_account_result(account_name: str) -> OCRText | None:
     texts = _ocr()
     section = [
         item for item in texts
-        if "公众号" in item.text and item.x < 0.35 and 0.20 < item.y < 0.90
+        if item.text.strip() == "公众号" and item.x < 0.35 and 0.20 < item.y < 0.90
     ]
     if section:
         anchor = sorted(section, key=lambda item: -item.y)[0]
@@ -953,40 +990,38 @@ def _find_next_article_on_account_page(
     visited_titles: set[str],
 ) -> OCRText | None:
     texts = _ocr()
-    label_y = None
-    for label in date_labels:
-        matches = [item for item in texts if label in item.text and 0.32 < item.x < 0.75]
-        if matches:
-            label_y = max(item.y for item in matches)
-            break
-    lower_bound = 0.0
-    if label_y is not None:
-        separators = [
-            item for item in texts
-            if item.y < label_y
-            and 0.32 < item.x < 0.75
-            and (
-                item.text in {"今天", "昨天"}
-                or item.text.startswith("星期")
-                or "年" in item.text and "月" in item.text and "日" in item.text
-            )
-        ]
-        if separators:
-            lower_bound = max(item.y for item in separators)
-    elif "今天" in date_labels:
+    separators = [
+        item for item in texts
+        if 0.32 < item.x < 0.75
+        and (
+            item.text in {"今天", "昨天"}
+            or item.text.startswith("星期")
+            or ("年" in item.text and "月" in item.text and "日" in item.text)
+        )
+    ]
+    target_separators = [
+        item for item in separators
+        if any(label in item.text for label in date_labels)
+    ]
+    sections: list[tuple[float, float]] = []
+    for anchor in sorted(target_separators, key=lambda item: -item.y):
+        next_separators = [item for item in separators if item.y < anchor.y]
+        lower_bound = max((item.y for item in next_separators), default=0.0)
+        sections.append((anchor.y, lower_bound))
+
+    if not sections and "今天" in date_labels:
         # Some account pages show today's cards as HH:MM without a "今天"
         # separator. Treat the cards below the profile area and above "昨天"
         # as today's articles.
-        label_y = 0.68
         yesterday = [
             item for item in texts
             if "昨天" in item.text
             and 0.32 < item.x < 0.75
-            and item.y < label_y
+            and item.y < 0.68
         ]
-        if yesterday:
-            lower_bound = max(item.y for item in yesterday)
-    if label_y is None:
+        sections.append((0.68, max((item.y for item in yesterday), default=0.0)))
+
+    if not sections:
         return None
 
     excluded = (
@@ -998,8 +1033,7 @@ def _find_next_article_on_account_page(
     raw_candidates = [
         item for item in texts
         if 0.32 < item.x < 0.57
-        and item.y < label_y
-        and item.y > lower_bound
+        and any(item.y < upper and item.y > lower for upper, lower in sections)
         and len(item.text) >= 6
         and item.w >= 0.08
         and re.search(r"[\u4e00-\u9fff]", item.text)
@@ -1027,7 +1061,7 @@ def _find_menu_text_containing(text: str) -> OCRText | None:
         item for item in _ocr()
         if text in item.text
         and 0.45 < item.x < 0.99
-        and 0.20 < item.y < 0.90
+        and 0.02 < item.y < 0.98
     ]
     return sorted(matches, key=lambda item: (-item.y, item.x))[0] if matches else None
 

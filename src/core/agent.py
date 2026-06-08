@@ -173,8 +173,9 @@ def fetch_wechat_foreground(
     """通过 Mac 微信前台短接管采集公众号文章 URL。
 
     旧搜狗/普通浏览器自动化在日期筛选和反爬上不稳定。这里改为
-    使用已验证的本机微信路径：搜索公众号 → 进入主页 → 识别日期分组 →
-    打开文章 → 复制 mp.weixin.qq.com URL。
+    使用已验证的本机微信路径：搜索公众号 → 进入推送窗口 →
+    点击右上账号按钮进入完整主页 → 识别日期分组 → 打开文章 →
+    通过文章菜单复制 mp.weixin.qq.com URL。
     """
     try:
         if isinstance(target_date, date):

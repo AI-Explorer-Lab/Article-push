@@ -248,7 +248,7 @@ WECHAT_ACCOUNT_IDS: dict[str, str] = {
 }
 ```
 
-微信公众号来源现在使用 Mac 微信前台短接管采集 URL：pipeline 会短暂接管微信，搜索公众号、进入主页、识别 `今天`/`昨天` 等日期分组，打开文章并复制 `mp.weixin.qq.com` URL。拿到 URL 后，正文抓取、清洗、评估和写作继续在后台执行。详细流程见 `docs/wechat_frontstage_url_capture.md`。
+微信公众号来源现在使用 Mac 微信前台短接管采集 URL：pipeline 会短暂接管微信，搜索公众号、进入推送窗口后点击右上账号按钮进入完整主页，再识别 `今天`/`昨天` 等日期分组，打开文章并通过 `... -> 复制链接` 获取 `mp.weixin.qq.com` URL。拿到 URL 后，正文抓取、清洗、评估和写作继续在后台执行。详细流程见 `docs/wechat_frontstage_url_capture.md`。
 
 相关环境变量：
 
