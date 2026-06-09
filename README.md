@@ -248,7 +248,7 @@ WECHAT_ACCOUNT_IDS: dict[str, str] = {
 }
 ```
 
-微信公众号来源现在使用本机微信前台短接管采集 URL：pipeline 会短暂接管微信，搜索公众号、进入推送窗口后点击右上账号按钮进入完整主页，再识别 `今天`/`昨天` 等日期分组，打开文章并通过 `... -> 复制链接` 获取 `mp.weixin.qq.com` URL。macOS 使用系统截图/OCR/AppleScript，Windows 使用 Win32/UI Automation/PowerShell。拿到 URL 后，正文抓取、清洗、评估和写作继续在后台执行。详细流程见 `docs/wechat_frontstage_url_capture.md`。
+微信公众号来源现在使用本机微信前台短接管采集 URL：pipeline 会短暂接管微信，搜索公众号、进入推送窗口或完整主页，识别 `今天`/`昨天` 等日期分组，打开文章并通过 `... -> 复制链接` 获取 `mp.weixin.qq.com` URL。macOS 使用系统截图/OCR/AppleScript/Swift，Windows 按策略分为两层：默认不做危险前台点击，优先诊断和缓存 fallback；显式设置 `WECHAT_WINDOWS_FOREGROUND_STRATEGY=visual` 后，使用 Codex Computer Use/截图优先路径，先看屏幕、真实点击微信最大化按钮，再按窗口相对位置搜索、打开公众号和复制链接。拿到 URL 后，正文抓取、清洗、评估和写作继续在后台执行。详细流程见 `docs/wechat_frontstage_url_capture.md`。
 
 相关环境变量：
 
@@ -257,13 +257,14 @@ WECHAT_ACCOUNT_IDS: dict[str, str] = {
 | `WECHAT_FOREGROUND_MAX_ARTICLES` | 每个公众号最多采集几篇文章 URL | `3` |
 | `WECHAT_FOREGROUND_ASSUME_READY` | 设为 `1` 时跳过前台接管确认提示 | 空 |
 | `WECHAT_FOREGROUND_KEEP_ACCOUNT_WINDOW` | 设为 `1` 时采集后保留公众号窗口；默认关闭窗口以便下一个公众号重新搜索 | 空 |
-| `WECHAT_WINDOWS_PROCESS` | Windows 微信进程名，多个用逗号分隔 | `WeChat,Weixin,微信` |
+| `WECHAT_WINDOWS_PROCESS` | Windows 微信进程名，多个用逗号分隔 | `WeChatAppEx,WeChat,Weixin,微信` |
 | `WECHAT_WINDOWS_ENABLE_DEEPLINK` | Windows 前台不可用时，是否允许用 `weixin://` 深链唤起搜索页；可能抢前台，默认关闭 | 空 |
-| `WECHAT_WINDOWS_STANDARDIZE_MODE` | Windows 是否自动标准化微信窗口；默认 `none`，只置前，不最大化、不移动窗口 | `none` |
-| `WECHAT_WINDOWS_FOREGROUND_STRATEGY` | Windows 前台采集策略；设为 `visual` 时启用截图优先的视觉点击路径，并在关键步骤前准备/最大化微信 | 未设置 |
-| `WECHAT_WINDOWS_VISUAL_MAXIMIZE_EACH_STEP` | `visual` 策略下是否在每个关键步骤前点击真实可见的微信最大化按钮 | `1` |
-| `WECHAT_WINDOWS_ALLOW_VISUAL_MAXIMIZE` | 设为 `1` 时才允许尝试点击微信标题栏最大化按钮；默认关闭，避免微信白屏 | 未设置 |
-| `WECHAT_WINDOWS_ALLOW_UNSAFE_RESIZE` | 设为 `1` 时才允许 `maximize/workarea` 这类 API/MoveWindow 实验；默认关闭，避免微信白屏 | 未设置 |
+| `WECHAT_WINDOWS_STANDARDIZE_MODE` | Windows 旧式窗口标准化模式；默认 `none`，不要依赖 API 最大化/移动窗口 | `none` |
+| `WECHAT_WINDOWS_FOREGROUND_STRATEGY` | Windows 前台采集策略；设为 `visual` 时启用截图优先的真实点击路径 | 未设置 |
+| `WECHAT_WINDOWS_VISUAL_MAXIMIZE_EACH_STEP` | `visual` 策略下是否在关键步骤前点击真实可见的微信最大化按钮 | `1` |
+| `WECHAT_WINDOWS_ALLOW_FOREGROUND_CLICKS` | 兼容旧策略的手动开关；不推荐，优先用 `WECHAT_WINDOWS_FOREGROUND_STRATEGY=visual` | 未设置 |
+| `WECHAT_WINDOWS_ALLOW_VISUAL_MAXIMIZE` | 旧 Python/Win32 视觉最大化开关；实测不如 Computer Use 真实点击稳定 | 未设置 |
+| `WECHAT_WINDOWS_ALLOW_UNSAFE_RESIZE` | 设为 `1` 时才允许 `ShowWindow`/`MoveWindow`/workarea 这类实验；默认关闭，避免微信白屏 | 未设置 |
 | `WECHAT_WINDOWS_SKIP_STANDARDIZE` | 设为 `1` 时完全跳过标准化，复用用户手动摆好的微信窗口 | 空 |
 | `WECHAT_WINDOWS_SEARCH_X/Y` | Windows 坐标回退：搜索框相对窗口位置 | `0.19` / `0.065` |
 | `WECHAT_WINDOWS_RESULT_X/Y` | Windows 坐标回退：搜索结果相对窗口位置 | `0.20` / `0.235` |
@@ -274,7 +275,14 @@ WECHAT_ACCOUNT_IDS: dict[str, str] = {
 | `WECHAT_WINDOWS_CACHE_ALLOW_STALE_BIZ` | Windows 缓存 fallback 是否允许按 `__biz` 返回较旧缓存 URL | 空 |
 | `WECHAT_WINDOWS_CACHE_BIZ_MAX_AGE_DAYS` | `WECHAT_WINDOWS_CACHE_ALLOW_STALE_BIZ=1` 时的最大缓存天数 | `1095` |
 
-Windows 采集默认只把微信窗口置前，不主动移动到 Codex 所在屏幕，也不强制拉伸窗口。Windows 微信对自动最大化/移动窗口比较敏感，可能触发白屏；因此默认使用窗口内固定坐标消息打开搜索框。诊断截图默认写入 `%TEMP%\wechat_foreground_debug`，优先抓取微信窗口本身；可用 `WECHAT_FOREGROUND_DEBUG=0` 关闭。
+Windows 采集的稳定原则是“先看见，再点击”：不要用 Win32 系统消息强制最大化、移动或拉伸微信窗口，因为 `ShowWindow(SW_MAXIMIZE)`、`WM_SYSCOMMAND/SC_MAXIMIZE`、`MoveWindow` 在 Windows 微信上实测可能触发白屏。已验证的 Windows 前台路径是在 Codex Computer Use 中激活微信、截图确认不是白屏、点击真实可见的最大化按钮，然后再用窗口相对位置点击搜索框、公众号结果、文章卡片和复制链接菜单。诊断截图默认写入 `%TEMP%\wechat_foreground_debug`，可用 `WECHAT_FOREGROUND_DEBUG=0` 关闭。
+
+2026-06-09 Windows 实测状态：
+
+- 已验证公众号：`QbitAI`、`ChallengeHub`、`老章`。
+- 已验证同一天多篇文章：`QbitAI` 同一个日期卡片内 4 篇文章都能复制到不同 URL。
+- 未完全验证场景：同一天文章多到需要在公众号浮层内部滚动时，滚动与继续采集还需要单独校准。
+- 复用到不同分辨率时，不应写死整屏绝对坐标；应先最大化微信，再基于当前窗口截图/窗口尺寸计算相对位置。
 
 真实接管前可以先做无点击预检：
 
