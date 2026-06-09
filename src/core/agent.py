@@ -19,7 +19,7 @@
 - 模板腔规避和检测已交给 Agent，不再靠硬编码正则替换/匹配
 
 微信公众号抓取策略：
-- 使用 Mac 微信前台短接管采集公众号主页文章 URL
+- 使用本机微信前台短接管采集公众号主页文章 URL
 - URL 获取后交给后台正文抓取逻辑处理
 """
 
@@ -78,7 +78,7 @@ FOCUS_TOPICS: dict[str, list[str]] = {
     ],
 }
 
-# 微信公众号来源（通过 Mac 微信前台短接管采集 URL）
+# 微信公众号来源（通过本机微信前台短接管采集 URL）
 # 配置在 src/constants/wechat_sources.py 中，此处从常量模块导入
 from src.constants.wechat_sources import WECHAT_SOURCES, WECHAT_SOURCE_ACCOUNTS
 from src.constants.info_sources import (
@@ -170,7 +170,7 @@ def fetch_wechat_foreground(
     target_date: str | date | None = None,
     prompt_user: bool = True,
 ) -> list[Candidate]:
-    """通过 Mac 微信前台短接管采集公众号文章 URL。
+    """通过本机微信前台短接管采集公众号文章 URL。
 
     旧搜狗/普通浏览器自动化在日期筛选和反爬上不稳定。这里改为
     使用已验证的本机微信路径：搜索公众号 → 进入推送窗口 →
@@ -518,7 +518,7 @@ def collect_candidates(days: int, logs: list[FetchLog], report_date: str | None 
     """收集所有候选文章。
 
     抓取策略：
-    - 微信公众号：Mac 微信前台短接管采集真实文章 URL
+    - 微信公众号：本机微信前台短接管采集真实文章 URL
       注意：这一阶段需要微信在前台，采集到 URL 后正文抓取会回到后台处理。
     - GitHub 最多 2 篇
     - 网页信息源（配置在 src/constants/info_sources.py）
@@ -526,7 +526,7 @@ def collect_candidates(days: int, logs: list[FetchLog], report_date: str | None 
     """
     all_candidates: list[Candidate] = []
 
-    # 1. 微信公众号（通过 Mac 微信前台短接管采集 URL）
+    # 1. 微信公众号（通过本机微信前台短接管采集 URL）
     wechat_count = len(WECHAT_SOURCES)
     for i, (account_name, query) in enumerate(WECHAT_SOURCES, 1):
         print(f"[FETCH] [{i}/{wechat_count}] 抓取微信公众号: {account_name}...")
