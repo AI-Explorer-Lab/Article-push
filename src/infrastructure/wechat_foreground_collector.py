@@ -18,13 +18,26 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
+
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+except Exception:
+    pass
 
 
 TMP_DIR = Path(os.getenv("TEMP") or os.getenv("TMP") or "/private/tmp") if sys.platform == "win32" else Path("/private/tmp")
 DEBUG_DIR = TMP_DIR / "wechat_foreground_debug"
+_WIN_VISUAL_MAXIMIZE_ATTEMPTED = False
+_WIN_WINDOW_TITLE_HINT = ""
+_WIN_WINDOW_PROCESS_HINT = ""
 
 
 @dataclass
@@ -67,7 +80,7 @@ class WeChatForegroundError(RuntimeError):
 
 def collect_wechat_article_urls(
     account_name: str,
-    max_articles: int = 3,
+    max_articles: int = 10,
     days: int = 1,
     target_date: str | date | None = None,
     prompt_user: bool = True,
@@ -94,7 +107,7 @@ def collect_wechat_article_urls(
 
 def _collect_wechat_article_urls_macos(
     account_name: str,
-    max_articles: int = 3,
+    max_articles: int = 10,
     days: int = 1,
     target_date: str | date | None = None,
     prompt_user: bool = True,
@@ -199,12 +212,24 @@ def _collect_wechat_article_urls_macos(
             url = _copy_visible_article_url()
             if "mp.weixin.qq.com" in url and url not in seen_urls:
                 print(f"[wechat_foreground] 获取 URL: {url[:90]}", flush=True)
+                published_date, date_ok = _verified_wechat_article_date(url, target, days)
+                if not date_ok:
+                    label = published_date.isoformat() if published_date else "unknown"
+                    print(
+                        f"[wechat_foreground] 跳过非目标日期文章: {label} {url[:90]}",
+                        flush=True,
+                    )
+                    seen_urls.add(url)
+                    _return_to_account_page()
+                    _ensure_full_account_home(account_name)
+                    _sleep(1.2, 0.25)
+                    continue
                 seen_urls.add(url)
                 urls.append(
                     WeChatArticleURL(
                         title=article.text,
                         url=url,
-                        published_at=target.isoformat(),
+                        published_at=(published_date or target).isoformat(),
                         snippet=f"微信前台采集: {account_name}",
                     )
                 )
@@ -256,6 +281,94 @@ def _date_labels_for_window(target: date, days: int) -> list[str]:
     if days > 1:
         labels.extend(["今天", "昨天"])
     return list(dict.fromkeys(labels))
+
+
+def _date_window_for_target(target: date, days: int) -> tuple[date, date]:
+    lookback_days = max(1, days)
+    return target - timedelta(days=lookback_days - 1), target
+
+
+def _date_in_window(value: date, target: date, days: int) -> bool:
+    start, end = _date_window_for_target(target, days)
+    return start <= value <= end
+
+
+def _fetch_wechat_article_published_date(url: str, timeout: float = 8.0) -> date | None:
+    """Best-effort extraction of a WeChat article publish date from its HTML."""
+    if "mp.weixin.qq.com" not in url:
+        return None
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        request = Request(url, headers=headers)
+        with urlopen(request, timeout=timeout) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            html_text = response.read(700_000).decode(charset, errors="replace")
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        return None
+    return _extract_wechat_article_published_date_from_html(html_text)
+
+
+def _extract_wechat_article_published_date_from_html(html_text: str) -> date | None:
+    text = html_text or ""
+    timestamp_patterns = (
+        r"\bct\s*=\s*['\"](\d{10})['\"]",
+        r"\bcreateTime\s*=\s*['\"](\d{10})['\"]",
+        r"\boriCreateTime\s*=\s*['\"](\d{10})['\"]",
+        r'"createTime"\s*:\s*"?(\d{10})',
+        r'"oriCreateTime"\s*:\s*"?(\d{10})',
+        r'"ct"\s*:\s*"?(\d{10})',
+    )
+    for pattern in timestamp_patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        try:
+            return datetime.fromtimestamp(int(match.group(1))).date()
+        except (ValueError, OSError):
+            continue
+
+    date_patterns = (
+        r'id=["\']publish_time["\'][^>]*>\s*([^<]+)',
+        r'\bpublish_time\s*=\s*["\']([^"\']+)',
+        r'(\d{4})[\u5e74\-/\.](\d{1,2})[\u6708\-/\.](\d{1,2})\s*[\u65e5]?',
+    )
+    for pattern in date_patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        candidate = match.group(1)
+        if match.lastindex and match.lastindex >= 3:
+            candidate = f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+        parsed = _parse_loose_date(candidate)
+        if parsed:
+            return parsed
+    return None
+
+
+def _parse_loose_date(value: str) -> date | None:
+    cleaned = re.sub(r"\s+", " ", value or "").strip()
+    match = re.search(r"(\d{4})[\u5e74\-/\.](\d{1,2})[\u6708\-/\.](\d{1,2})", cleaned)
+    if not match:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
+def _verified_wechat_article_date(url: str, target: date, days: int) -> tuple[date | None, bool]:
+    published = _fetch_wechat_article_published_date(url)
+    if published is None:
+        if os.getenv("WECHAT_FOREGROUND_REQUIRE_DATE_VERIFY", "1").strip() == "0":
+            return None, True
+        return None, False
+    return published, _date_in_window(published, target, days)
 
 
 def _is_interactive() -> bool:
@@ -1090,7 +1203,7 @@ def _find_next_article_on_account_page(
 
 def _collect_wechat_article_urls_windows(
     account_name: str,
-    max_articles: int = 3,
+    max_articles: int = 10,
     days: int = 1,
     target_date: str | date | None = None,
     prompt_user: bool = True,
@@ -1104,23 +1217,40 @@ def _collect_wechat_article_urls_windows(
     """
     target = _coerce_target_date(target_date)
     date_labels = _date_labels_for_window(target, days)
+    _win_reset_visual_session()
+    _win_set_window_title_hint("")
+    _win_set_window_process_hint("Weixin")
+
+    windows_strategy = os.getenv("WECHAT_WINDOWS_FOREGROUND_STRATEGY", "").strip() or "cache"
+    print(f"[wechat_foreground] Windows foreground strategy: {windows_strategy}", flush=True)
+    cache_fallback_enabled = os.getenv("WECHAT_WINDOWS_ALLOW_CACHE_FALLBACK", "").strip() == "1"
 
     if not _win_foreground_clicks_enabled():
         print(
             "[wechat_foreground] Windows foreground clicks are disabled by default because they can white-screen WeChat; "
-            "using cache fallback only. Set WECHAT_WINDOWS_FOREGROUND_STRATEGY=visual for screenshot-first foreground collection.",
+            "using cache fallback only. Set WECHAT_WINDOWS_FOREGROUND_STRATEGY=visual for screenshot-first foreground collection. "
+            f"Current WECHAT_WINDOWS_FOREGROUND_STRATEGY={windows_strategy!r}.",
             flush=True,
         )
+        if not cache_fallback_enabled:
+            raise WeChatForegroundError(
+                "Windows foreground collection is disabled and cache fallback is disabled."
+            )
         cached = _collect_wechat_article_urls_windows_cache(
             account_name=account_name,
             max_articles=max_articles,
             target_date=target,
+            days=days,
         )
         if cached:
             return cached
         raise WeChatForegroundError(
             "Windows foreground clicks are disabled and no matching WeChat cache URL was found."
         )
+
+    visual_strategy = _win_visual_strategy_enabled()
+    if visual_strategy and os.getenv("WECHAT_WINDOWS_REQUIRE_VISUAL_PREFLIGHT", "1").strip() != "0":
+        _win_require_visual_preflight(account_name)
 
     user_confirmed_foreground = False
     if prompt_user and _is_interactive():
@@ -1135,55 +1265,63 @@ def _collect_wechat_article_urls_windows(
         os.environ.setdefault("WECHAT_WINDOWS_ENABLE_DEEPLINK", "1")
 
     foreground_error: WeChatForegroundError | None = None
-    try:
-        _win_activate_wechat()
-    except WeChatForegroundError as exc:
-        if _win_search_deeplink_enabled(user_confirmed_foreground):
-            print(f"[wechat_foreground] Windows 前台接管不可用，尝试微信搜索深链唤起: {exc}", flush=True)
-            _win_open_search_deeplink(account_name)
-            _sleep(3.0, 0.3)
-            try:
-                _win_activate_wechat()
-            except WeChatForegroundError as retry_exc:
-                foreground_error = retry_exc
+    if not visual_strategy:
+        try:
+            _win_activate_wechat()
+        except WeChatForegroundError as exc:
+            if _win_search_deeplink_enabled(user_confirmed_foreground):
+                print(f"[wechat_foreground] Windows 前台接管不可用，尝试微信搜索深链唤起: {exc}", flush=True)
+                _win_open_search_deeplink(account_name)
+                _sleep(3.0, 0.3)
+                try:
+                    _win_activate_wechat()
+                except WeChatForegroundError as retry_exc:
+                    foreground_error = retry_exc
+                else:
+                    print("[wechat_foreground] Windows 搜索深链唤起成功，继续前台采集", flush=True)
             else:
-                print("[wechat_foreground] Windows 搜索深链唤起成功，继续前台采集", flush=True)
-        else:
-            print("[wechat_foreground] Windows 前台接管不可用，深链唤起未启用，直接尝试缓存 URL fallback。", flush=True)
-            foreground_error = exc
+                print("[wechat_foreground] Windows 前台接管不可用，深链唤起未启用。", flush=True)
+                foreground_error = exc
 
     if foreground_error is not None:
+        if not cache_fallback_enabled:
+            raise foreground_error
         print(f"[wechat_foreground] Windows 前台接管不可用，尝试缓存 URL fallback: {foreground_error}", flush=True)
         cached = _collect_wechat_article_urls_windows_cache(
             account_name=account_name,
             max_articles=max_articles,
             target_date=target,
+            days=days,
         )
         if cached:
             print(f"[wechat_foreground] Windows 缓存 fallback 获取 URL: {len(cached)} 篇", flush=True)
             return cached
         raise foreground_error
-    try:
-        _win_assert_renderable(account_name, "before_standardize")
-    except WeChatForegroundError as exc:
-        cached = _collect_wechat_article_urls_windows_cache(
-            account_name=account_name,
-            max_articles=max_articles,
-            target_date=target,
-        )
-        if cached:
-            print(f"[wechat_foreground] Windows 主窗口不可渲染，缓存 fallback 获取 URL: {len(cached)} 篇", flush=True)
-            return cached
-        raise exc
-    _win_prepare_visual_step("before_standardize")
-    _win_standardize_wechat_window()
-    _sleep(0.6, 0.12)
-    _win_assert_renderable(account_name, "activated")
+    if not visual_strategy:
+        try:
+            _win_assert_renderable(account_name, "before_standardize")
+        except WeChatForegroundError as exc:
+            if not cache_fallback_enabled:
+                raise exc
+            cached = _collect_wechat_article_urls_windows_cache(
+                account_name=account_name,
+                max_articles=max_articles,
+                target_date=target,
+                days=days,
+            )
+            if cached:
+                print(f"[wechat_foreground] Windows 主窗口不可渲染，缓存 fallback 获取 URL: {len(cached)} 篇", flush=True)
+                return cached
+            raise exc
+        _win_standardize_wechat_window()
+        _sleep(0.6, 0.12)
+        _win_assert_renderable(account_name, "activated")
 
     print(f"[wechat_foreground] Windows 搜索公众号: {account_name}", flush=True)
-    _win_prepare_visual_step("search")
+    if not visual_strategy:
+        _win_prepare_visual_step("search")
     _win_search_account(account_name)
-    _sleep(1.0, 0.2)
+    _sleep(_win_env_float("WECHAT_WINDOWS_AFTER_SEARCH_WAIT", 0.65), 0.12)
     _win_debug_capture(account_name, "after_search")
 
     _win_prepare_visual_step("open_account_result")
@@ -1192,6 +1330,7 @@ def _collect_wechat_article_urls_windows(
         raise WeChatForegroundError(f"Windows 微信未找到公众号搜索结果: {account_name}")
 
     _sleep(1.6, 0.25)
+    _win_mark_account_window(account_name)
     _win_debug_capture(account_name, "account_result_opened")
     _win_ensure_full_account_home(account_name)
     _win_debug_capture(account_name, "account_page")
@@ -1199,11 +1338,18 @@ def _collect_wechat_article_urls_windows(
     urls: list[WeChatArticleURL] = []
     visited: set[str] = set()
     seen_urls: set[str] = set()
+    account_handle = _win_foreground_handle() if _win_visual_strategy_enabled() else 0
+    if account_handle:
+        _win_assert_wechat_window_handle(account_handle, "account window")
 
     try:
         for attempt in range(max_articles * 3):
             if len(urls) >= max_articles:
                 break
+
+            if _win_visual_strategy_enabled() and account_handle:
+                _win_focus_known_window(account_handle)
+                _sleep(0.4, 0.08)
 
             article = _win_find_next_article_on_account_page(date_labels, visited)
             if article:
@@ -1222,20 +1368,41 @@ def _collect_wechat_article_urls_windows(
                     _win_print_visible_texts(account_name, "missing_article")
                     break
 
+            _win_set_window_title_hint("")
+            _win_set_window_process_hint("WeChatAppEx")
             _sleep(3.0, 0.4)
+            article_handle = _win_foreground_handle() if _win_visual_strategy_enabled() else 0
+            if article_handle:
+                _win_assert_wechat_window_handle(article_handle, "article window")
+            if _win_visual_strategy_enabled() and article_handle == account_handle:
+                print("[wechat_foreground] Windows 文章窗口未打开，跳过当前卡片继续尝试。", flush=True)
+                _win_set_window_title_hint(account_name)
+                _win_set_window_process_hint("Weixin")
+                continue
             _win_debug_capture(account_name, f"article_page_{attempt + 1}")
             _win_prepare_visual_step("copy_article_url")
-            url = _win_copy_visible_article_url()
+            url = _win_copy_visible_article_url(article_handle if _win_visual_strategy_enabled() else None)
             url = _extract_mp_weixin_url(url)
 
             if "mp.weixin.qq.com" in url and url not in seen_urls:
                 print(f"[wechat_foreground] Windows 获取 URL: {url[:90]}", flush=True)
+                published_date, date_ok = _verified_wechat_article_date(url, target, days)
+                if not date_ok:
+                    label = published_date.isoformat() if published_date else "unknown"
+                    print(
+                        f"[wechat_foreground] Windows 跳过非目标日期文章: {label} {url[:90]}",
+                        flush=True,
+                    )
+                    seen_urls.add(url)
+                    _win_restore_account_after_article(account_name, account_handle, article_handle)
+                    _sleep(1.0, 0.2)
+                    continue
                 seen_urls.add(url)
                 urls.append(
                     WeChatArticleURL(
                         title=title,
                         url=url,
-                        published_at=target.isoformat(),
+                        published_at=(published_date or target).isoformat(),
                         snippet=f"Windows 微信前台采集: {account_name}",
                     )
                 )
@@ -1244,26 +1411,79 @@ def _collect_wechat_article_urls_windows(
             else:
                 print("[wechat_foreground] Windows 未复制到微信文章 URL", flush=True)
 
-            _win_return_to_account_page()
-            _win_ensure_full_account_home(account_name, soft=True)
+            _win_set_window_title_hint(account_name)
+            _win_set_window_process_hint("Weixin")
+            _win_restore_account_after_article(account_name, account_handle, article_handle)
             _sleep(1.0, 0.2)
     finally:
-        _win_cleanup_after_account()
+        if _win_visual_strategy_enabled():
+            _win_cleanup_after_account_visual(account_handle)
+        else:
+            _win_cleanup_after_account()
 
     if prompt_user:
         print("[wechat_foreground] Windows 微信前台接管结束，可以继续使用电脑。", flush=True)
     return urls
 
 
+def _win_restore_account_after_article(account_name: str, account_handle: int, article_handle: int) -> None:
+    """Return Windows collection to the known account window without global shortcuts."""
+    _win_set_window_title_hint(account_name)
+    _win_set_window_process_hint("Weixin")
+    if _win_visual_strategy_enabled():
+        if article_handle and article_handle != account_handle:
+            _win_close_known_window(article_handle)
+            _sleep(0.8, 0.15)
+        if account_handle:
+            _win_focus_known_window(account_handle)
+        return
+    _win_return_to_account_page()
+    _win_ensure_full_account_home(account_name, soft=True)
+
+
+def _win_cleanup_after_account_visual(account_handle: int) -> None:
+    """Close the known account popup and return to the existing main WeChat window."""
+    if os.getenv("WECHAT_FOREGROUND_KEEP_ACCOUNT_WINDOW", "").strip() == "1":
+        return
+    _win_set_window_title_hint("")
+    _win_set_window_process_hint("Weixin")
+    main_handle = 0
+    try:
+        main_handle = _win_choose_existing_wechat_window_handle()
+    except Exception:
+        main_handle = 0
+
+    try:
+        if account_handle and account_handle != main_handle:
+            _win_close_known_window(account_handle)
+            _sleep(0.5, 0.1)
+    except WeChatForegroundError as exc:
+        print(f"[wechat_foreground] Windows visual cleanup skipped account window close: {exc}", flush=True)
+
+    if main_handle:
+        try:
+            _win_focus_known_window(main_handle)
+        except WeChatForegroundError as exc:
+            print(f"[wechat_foreground] Windows visual cleanup could not focus main WeChat: {exc}", flush=True)
+
+
 def _collect_wechat_article_urls_windows_cache(
     account_name: str,
-    max_articles: int = 3,
+    max_articles: int = 10,
     target_date: str | date | None = None,
+    days: int = 1,
 ) -> list[WeChatArticleURL]:
     """Extract recent mp.weixin.qq.com article URLs from Windows WeChat cache."""
     biz_hints = _windows_cache_biz_hints(account_name)
     candidates = _scan_windows_wechat_cache_urls(limit=max(max_articles * 1000, 5000))
-    urls = _filter_windows_cache_candidates(account_name, candidates, max_articles, allow_biz=True)
+    urls = _filter_windows_cache_candidates(
+        account_name,
+        candidates,
+        max_articles,
+        allow_biz=True,
+        target_date=target_date,
+        days=days,
+    )
     if urls:
         return urls
 
@@ -1273,7 +1493,14 @@ def _collect_wechat_article_urls_windows_cache(
             limit=max(max_articles * 1000, 5000),
             max_age_days=max_age,
         )
-        return _filter_windows_cache_candidates(account_name, candidates, max_articles, allow_biz=True)
+        return _filter_windows_cache_candidates(
+            account_name,
+            candidates,
+            max_articles,
+            allow_biz=True,
+            target_date=target_date,
+            days=days,
+        )
     return []
 
 
@@ -1282,11 +1509,14 @@ def _filter_windows_cache_candidates(
     candidates: list[dict[str, object]],
     max_articles: int,
     allow_biz: bool = True,
+    target_date: str | date | None = None,
+    days: int = 1,
 ) -> list[WeChatArticleURL]:
     urls: list[WeChatArticleURL] = []
     seen: set[str] = set()
     query = account_name.lower()
     biz_hints = _windows_cache_biz_hints(account_name) if allow_biz else set()
+    target = _coerce_target_date(target_date)
     for item in candidates:
         url = str(item.get("url", ""))
         key = _wechat_article_key(url)
@@ -1301,12 +1531,15 @@ def _filter_windows_cache_candidates(
         matches_biz = bool(url_biz and url_biz in biz_hints)
         if not (matches_name or matches_biz) and os.getenv("WECHAT_WINDOWS_CACHE_ALLOW_RECENT", "") != "1":
             continue
+        published_date, date_ok = _verified_wechat_article_date(url, target, days)
+        if not date_ok:
+            continue
         seen.add(key)
         urls.append(
             WeChatArticleURL(
                 title=title or f"{brand or account_name} Windows 微信缓存文章 {len(urls) + 1}",
                 url=url,
-                published_at=_cache_item_date(item),
+                published_at=(published_date or target).isoformat(),
                 snippet=f"Windows 微信缓存采集: {brand or account_name}",
             )
         )
@@ -1515,7 +1748,264 @@ def _win_powershell(script: str, *args: str, timeout: float = 15.0) -> str:
 
 
 def _win_process_names() -> str:
-    return os.getenv("WECHAT_WINDOWS_PROCESS", "WeChatAppEx,WeChat,Weixin,微信")
+    return os.getenv("WECHAT_WINDOWS_PROCESS", "Weixin,WeChat,微信,WeChatAppEx")
+
+
+def _win_require_visual_preflight(account_name: str) -> None:
+    preflight = preflight_windows_wechat_visual(capture=True)
+    foreground_maximize_error: WeChatForegroundError | None = None
+    initial_visual_checked = False
+    if not preflight.get("ready") and _win_preflight_blocker(preflight) == "foreground_wechat_window_not_maximized":
+        try:
+            _win_ensure_foreground_visual_maximized(account_name, verify_renderable=False)
+        except WeChatForegroundError as exc:
+            foreground_maximize_error = exc
+        else:
+            initial_visual_checked = True
+            _sleep(_win_env_float("WECHAT_WINDOWS_AFTER_INITIAL_MAXIMIZE_WAIT", 0.35), 0.08)
+            preflight = preflight_windows_wechat_visual(capture=True)
+    if not preflight.get("ready") and _win_visual_auto_reveal_enabled() and _win_preflight_can_auto_reveal(preflight):
+        _win_auto_reveal_wechat_visual(account_name)
+        initial_visual_checked = True
+        _sleep(_win_env_float("WECHAT_WINDOWS_AFTER_AUTO_REVEAL_WAIT", 0.7), 0.12)
+        preflight = preflight_windows_wechat_visual(capture=True)
+    if not preflight.get("ready") and _win_preflight_blocker(preflight) == "foreground_wechat_window_not_maximized":
+        _win_ensure_foreground_visual_maximized(account_name, verify_renderable=False)
+        initial_visual_checked = True
+        _sleep(_win_env_float("WECHAT_WINDOWS_AFTER_INITIAL_MAXIMIZE_WAIT", 0.35), 0.08)
+        preflight = preflight_windows_wechat_visual(capture=True)
+    if preflight.get("ready"):
+        if not initial_visual_checked:
+            _win_ensure_initial_visual_maximized(account_name)
+        return
+    if foreground_maximize_error is not None and not _win_visual_auto_reveal_enabled():
+        raise foreground_maximize_error
+    blockers = "; ".join(str(item) for item in preflight.get("blockers", []))
+    raise WeChatForegroundError(
+        "Windows visual preflight failed; refusing foreground clicks to avoid white-screening "
+        f"WeChat or closing another app. Blockers: {blockers or 'unknown'}"
+    )
+
+
+def _win_visual_auto_reveal_enabled() -> bool:
+    return os.getenv("WECHAT_WINDOWS_AUTO_REVEAL", "1").strip() != "0"
+
+
+def _win_preflight_blocker(preflight: dict[str, object]) -> str:
+    diagnosis = preflight.get("diagnosis", {})
+    if not isinstance(diagnosis, dict):
+        return ""
+    return str(diagnosis.get("foreground_blocker", ""))
+
+
+def _win_preflight_can_auto_reveal(preflight: dict[str, object]) -> bool:
+    diagnosis = preflight.get("diagnosis", {})
+    if not isinstance(diagnosis, dict):
+        return False
+    blocker = str(diagnosis.get("foreground_blocker", ""))
+    if bool(diagnosis.get("screen_capture_black")):
+        return False
+    return blocker in {
+        "no_visible_wechat_window",
+        "foreground_not_wechat",
+        "foreground_wechat_window_not_maximized",
+        "uia_text_unavailable",
+    }
+
+
+def _win_allowed_process_names() -> set[str]:
+    names = {name.strip().lower() for name in _win_process_names().split(",") if name.strip()}
+    names.update({"weixin", "wechat", "wechatappex"})
+    return names
+
+
+def _win_process_name_is_wechat(process_name: str) -> bool:
+    return process_name.strip().lower() in _win_allowed_process_names()
+
+
+def _win_foreground_process_name() -> str:
+    handle = _win_foreground_handle()
+    if not handle:
+        return ""
+    try:
+        return _win_window_process_name_for_handle(handle)
+    except Exception:
+        return ""
+
+
+def _win_ui_text_has_content(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return False
+    shell_labels = {"Weixin", "WeChat", "微信"}
+    if normalized in shell_labels:
+        return False
+    if normalized.startswith("Weixin ") or normalized.startswith("WeChat "):
+        return False
+    return True
+
+
+def _win_content_texts(texts: list[OCRText]) -> list[OCRText]:
+    return [item for item in texts if _win_ui_text_has_content(item.text)]
+
+
+def _win_screenshot_looks_black(stats: dict[str, object]) -> bool:
+    return bool(
+        stats
+        and float(stats.get("black_ratio", 0.0)) >= 0.98
+        and float(stats.get("avg_luma", 255.0)) <= 3.0
+    )
+
+
+def _win_screenshot_looks_white_without_content(stats: dict[str, object], texts: list[OCRText]) -> bool:
+    return bool(
+        stats
+        and float(stats.get("black_ratio", 1.0)) <= 0.02
+        and float(stats.get("avg_luma", 0.0)) >= 245.0
+        and not _win_content_texts(texts)
+    )
+
+
+def _win_window_usable_for_visual(info: WindowsWindowInfo | None) -> bool:
+    if info is None:
+        return False
+    return not _win_window_info_looks_minimized(info) and info.width >= 560 and info.height >= 500
+
+
+def _win_launch_wechat_if_needed(force: bool = False) -> None:
+    """Bring up the real WeChat app window before any search-box automation."""
+    if not force and os.getenv("WECHAT_WINDOWS_ALLOW_LAUNCH", "").strip() != "1":
+        return
+    candidates = [
+        os.getenv("WECHAT_WINDOWS_EXE", "").strip(),
+        os.getenv("WECHAT_WINDOWS_EXE_PATH", "").strip(),
+        *_win_running_wechat_exe_paths(),
+        r"D:\Weixin\Weixin.exe",
+        r"C:\Program Files\Tencent\WeChat\WeChat.exe",
+        r"C:\Program Files (x86)\Tencent\WeChat\WeChat.exe",
+    ]
+    exe = next((path for path in candidates if path and Path(path).exists()), "")
+    if not exe:
+        return
+    try:
+        _win_powershell("Start-Process -FilePath $args[0]", exe, timeout=6.0)
+        _sleep(1.2, 0.2)
+    except Exception as exc:
+        print(f"[wechat_foreground] Windows launch WeChat skipped: {exc}", flush=True)
+
+
+def _win_running_wechat_exe_paths() -> list[str]:
+    script = r'''
+$names = $args[0] -split ','
+$paths = New-Object System.Collections.Generic.List[string]
+foreach ($name in $names) {
+  $procs = Get-Process -Name $name.Trim() -ErrorAction SilentlyContinue
+  foreach ($proc in $procs) {
+    try {
+      if ($proc.Path -and -not $paths.Contains($proc.Path)) {
+        $paths.Add($proc.Path) | Out-Null
+      }
+    } catch {}
+  }
+}
+$paths
+'''
+    try:
+        out = _win_powershell(script, _win_process_names(), timeout=6.0)
+    except Exception:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _win_auto_reveal_wechat_visual(account_name: str) -> None:
+    """Bring an existing WeChat window forward before visual clicks."""
+    print("[wechat_foreground] Windows visual preflight blocked; trying automatic WeChat reveal.", flush=True)
+    _win_reveal_existing_wechat_window()
+    _sleep(_win_env_float("WECHAT_WINDOWS_AFTER_RESTORE_WAIT", 0.45), 0.08)
+    _win_ensure_initial_visual_maximized(account_name, verify_renderable=False)
+    if os.getenv("WECHAT_WINDOWS_AUTO_REVEAL_USE_DEEPLINK", "").strip() == "1":
+        _win_open_search_deeplink(account_name, force=True)
+        _sleep(1.6, 0.25)
+    if os.getenv("WECHAT_WINDOWS_AUTO_REVEAL_ALLOW_LAUNCH", "").strip() == "1":
+        _win_launch_wechat_if_needed(force=True)
+
+
+def _win_reveal_existing_wechat_window() -> None:
+    handle = _win_choose_existing_wechat_window_handle()
+    if not handle:
+        print("[wechat_foreground] Windows auto reveal found no existing WeChat window handle.", flush=True)
+        return
+    try:
+        _win_assert_wechat_window_handle(handle, "auto reveal")
+        _win_restore_existing_window(handle)
+    except Exception as exc:
+        print(f"[wechat_foreground] Windows auto reveal skipped existing window restore: {exc}", flush=True)
+
+
+def _win_choose_existing_wechat_window_handle() -> int:
+    try:
+        info = _win_wechat_window_info(activate=False)
+        if _win_window_usable_for_visual(info):
+            return info.handle
+    except Exception:
+        pass
+
+    probe = _win_window_probe()
+    candidates: list[tuple[int, int]] = []
+    for item in probe:
+        try:
+            handle = int(item.get("main_window_handle", 0))
+            if handle <= 0:
+                continue
+            all_windows = int(item.get("all_top_windows", 0))
+            visible_windows = int(item.get("visible_top_windows", 0))
+        except (TypeError, ValueError):
+            continue
+        # A logged-in WeChat session usually owns many top-level helper windows,
+        # while a newly spawned login shell owns only a few. Prefer the richer
+        # existing session instead of creating or selecting a fresh login shell.
+        score = (all_windows * 100) + visible_windows
+        candidates.append((score, handle))
+    if not candidates:
+        return 0
+    return sorted(candidates, reverse=True)[0][1]
+
+
+def _win_restore_existing_window(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    hwnd = ctypes.c_void_p(handle)
+    user32.IsIconic.argtypes = [ctypes.c_void_p]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.ShowWindowAsync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user32.ShowWindowAsync.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+
+    # Restore/show only the existing top-level window. Fullscreen is handled by
+    # a separate visible title-bar click so it cannot silently launch/resize a
+    # different WeChat instance.
+    sw_restore = 9
+    sw_show = 5
+    user32.ShowWindowAsync(hwnd, sw_restore if user32.IsIconic(hwnd) else sw_show)
+    hwnd_top = ctypes.c_void_p(0)
+    swp_nomove = 0x0002
+    swp_nosize = 0x0001
+    swp_showwindow = 0x0040
+    user32.SetWindowPos(hwnd, hwnd_top, 0, 0, 0, 0, swp_nomove | swp_nosize | swp_showwindow)
+    user32.SetForegroundWindow(hwnd)
 
 
 def diagnose_windows_wechat_foreground(capture: bool = True) -> dict[str, object]:
@@ -1526,7 +2016,16 @@ def diagnose_windows_wechat_foreground(capture: bool = True) -> dict[str, object
     probe = _win_window_probe()
     visible_windows = sum(int(item.get("visible_top_windows", 0)) for item in probe)
     all_windows = sum(int(item.get("all_top_windows", 0)) for item in probe)
-    texts = _win_texts() if visible_windows else []
+    foreground_handle = _win_foreground_handle()
+    foreground_process = _win_foreground_process_name()
+    foreground_is_wechat = _win_process_name_is_wechat(foreground_process)
+    foreground_info: WindowsWindowInfo | None = None
+    if foreground_handle:
+        try:
+            foreground_info = _win_window_info_for_handle(foreground_handle)
+        except Exception:
+            foreground_info = None
+    foreground_maximized = bool(foreground_info and _win_window_looks_maximized(foreground_info))
     screenshot = ""
     screenshot_stats: dict[str, object] = {}
     if capture:
@@ -1538,24 +2037,34 @@ def diagnose_windows_wechat_foreground(capture: bool = True) -> dict[str, object
         if screenshot:
             screenshot_stats = _win_screenshot_stats(Path(screenshot))
 
-    screen_black = bool(
-        screenshot_stats
-        and float(screenshot_stats.get("black_ratio", 0.0)) >= 0.98
-        and float(screenshot_stats.get("avg_luma", 255.0)) <= 2.0
-    )
-    screen_white = bool(
-        screenshot_stats
-        and float(screenshot_stats.get("black_ratio", 1.0)) <= 0.01
-        and float(screenshot_stats.get("avg_luma", 0.0)) >= 252.0
-        and not texts
-    )
+    texts: list[OCRText] = []
+    if visible_windows:
+        # UI Automation text enumeration is slow in Windows WeChat. Use the
+        # screenshot first; only ask UIA for text when there is no capture or
+        # the capture is bright enough to need a white-screen/content check.
+        needs_text_probe = not capture or not screenshot_stats or (
+            float(screenshot_stats.get("black_ratio", 1.0)) <= 0.02
+            and float(screenshot_stats.get("avg_luma", 0.0)) >= 245.0
+        )
+        if needs_text_probe:
+            texts = _win_texts()
+
+    content_texts = _win_content_texts(texts)
+    screen_black = _win_screenshot_looks_black(screenshot_stats)
+    screen_white = _win_screenshot_looks_white_without_content(screenshot_stats, texts)
     if visible_windows <= 0:
         blocker = "no_visible_wechat_window"
+    elif not foreground_is_wechat:
+        blocker = "foreground_not_wechat"
     elif screen_black:
         blocker = "screen_capture_black"
     elif screen_white:
         blocker = "screen_capture_white"
-    elif not texts:
+    elif not _win_window_usable_for_visual(foreground_info):
+        blocker = "foreground_wechat_window_too_small"
+    elif not foreground_maximized:
+        blocker = "foreground_wechat_window_not_maximized"
+    elif not content_texts and not screenshot_stats:
         blocker = "uia_text_unavailable"
     else:
         blocker = ""
@@ -1567,14 +2076,54 @@ def diagnose_windows_wechat_foreground(capture: bool = True) -> dict[str, object
         "processes": probe,
         "all_top_windows": all_windows,
         "visible_top_windows": visible_windows,
+        "foreground_handle": foreground_handle,
+        "foreground_process": foreground_process,
+        "foreground_is_wechat": foreground_is_wechat,
+        "foreground_window": foreground_info.__dict__ if foreground_info else {},
+        "foreground_window_maximized": foreground_maximized,
         "screen_capture_black": screen_black,
         "screen_capture_white": screen_white,
         "foreground_available": blocker == "",
         "foreground_blocker": blocker,
         "uia_text_count": len(texts),
+        "uia_content_text_count": len(content_texts),
         "uia_text_preview": [item.text for item in sorted(texts, key=lambda item: (-item.y, item.x))[:24]],
         "debug_screenshot": screenshot,
         "debug_screenshot_stats": screenshot_stats,
+    }
+
+
+def preflight_windows_wechat_visual(capture: bool = True) -> dict[str, object]:
+    """No-click readiness check for the Windows visual foreground strategy."""
+    diagnosis = diagnose_windows_wechat_foreground(capture=capture)
+    strategy = os.getenv("WECHAT_WINDOWS_FOREGROUND_STRATEGY", "").strip() or "cache"
+    cache_fallback_enabled = os.getenv("WECHAT_WINDOWS_ALLOW_CACHE_FALLBACK", "").strip() == "1"
+    visual_enabled = strategy.lower() == "visual"
+    date_verify_enabled = os.getenv("WECHAT_FOREGROUND_REQUIRE_DATE_VERIFY", "1").strip() != "0"
+    max_articles = _win_env_int("WECHAT_FOREGROUND_MAX_ARTICLES", 10)
+
+    blockers: list[str] = []
+    if not visual_enabled:
+        blockers.append("WECHAT_WINDOWS_FOREGROUND_STRATEGY must be visual")
+    if cache_fallback_enabled:
+        blockers.append("WECHAT_WINDOWS_ALLOW_CACHE_FALLBACK should be 0 for real foreground testing")
+    if not date_verify_enabled:
+        blockers.append("WECHAT_FOREGROUND_REQUIRE_DATE_VERIFY should be 1 to avoid wrong-day URLs")
+    if max_articles < 2:
+        blockers.append("WECHAT_FOREGROUND_MAX_ARTICLES should be >= 2 for multi-article days")
+
+    foreground_blocker = str(diagnosis.get("foreground_blocker", ""))
+    if foreground_blocker:
+        blockers.append(f"foreground not ready: {foreground_blocker}")
+
+    return {
+        "ready": not blockers,
+        "blockers": blockers,
+        "visual_strategy": strategy,
+        "cache_fallback_enabled": cache_fallback_enabled,
+        "date_verify_enabled": date_verify_enabled,
+        "max_articles": max_articles,
+        "diagnosis": diagnosis,
     }
 
 
@@ -1584,6 +2133,7 @@ Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public class WeChatProbeWin32 {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
@@ -1593,6 +2143,7 @@ public class WeChatProbeWin32 {
   public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 }
 "@
+[WeChatProbeWin32]::SetProcessDPIAware() | Out-Null
 $names = $args[0] -split ','
 foreach ($name in $names) {
   $procs = Get-Process -Name $name.Trim() -ErrorAction SilentlyContinue | Sort-Object StartTime -Descending
@@ -1644,11 +2195,17 @@ foreach ($name in $names) {
 
 
 def _win_wechat_window_info(activate: bool = True) -> WindowsWindowInfo:
+    if activate and _win_visual_strategy_enabled():
+        raise WeChatForegroundError(
+            "Windows visual 模式禁止 Win32 强制激活微信；请使用任务栏真实点击路径。"
+        )
     script = r'''
 Add-Type @"
 using System;
+using System.Text;
 using System.Runtime.InteropServices;
 public class WeChatWindowInfoWin32 {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
@@ -1656,14 +2213,24 @@ public class WeChatWindowInfoWin32 {
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr SetActiveWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder text, int maxCount);
   public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 }
 "@
+[WeChatWindowInfoWin32]::SetProcessDPIAware() | Out-Null
 $names = $args[0] -split ','
 $activate = $args[1] -eq '1'
+$titleHint = $args[2]
+$processHint = $args[3]
 $script:selectedHandle = [IntPtr]::Zero
-$script:selectedArea = 0
+$script:selectedScore = 0
 foreach ($name in $names) {
   $procs = Get-Process -Name $name.Trim() -ErrorAction SilentlyContinue | Sort-Object StartTime -Descending
   foreach ($candidate in $procs) {
@@ -1671,14 +2238,35 @@ foreach ($name in $names) {
       param([IntPtr]$hWnd, [IntPtr]$lParam)
       $windowPid = 0
       [WeChatWindowInfoWin32]::GetWindowThreadProcessId($hWnd, [ref]$windowPid) | Out-Null
-      if ($windowPid -eq $candidate.Id -and -not [WeChatWindowInfoWin32]::IsIconic($hWnd)) {
+      $visible = [WeChatWindowInfoWin32]::IsWindowVisible($hWnd)
+      $iconic = [WeChatWindowInfoWin32]::IsIconic($hWnd)
+      if ($windowPid -eq $candidate.Id) {
         $rect = New-Object WeChatWindowInfoWin32+RECT
         [WeChatWindowInfoWin32]::GetWindowRect($hWnd, [ref]$rect) | Out-Null
         $width = [Math]::Max(0, $rect.Right - $rect.Left)
         $height = [Math]::Max(0, $rect.Bottom - $rect.Top)
         $area = $width * $height
-        if ($width -ge 700 -and $height -ge 500 -and $area -gt $script:selectedArea) {
-          $script:selectedArea = $area
+        $sb = New-Object System.Text.StringBuilder 512
+        [WeChatWindowInfoWin32]::GetWindowTextW($hWnd, $sb, $sb.Capacity) | Out-Null
+        $title = $sb.ToString()
+        if ($title -eq "WxTrayIconMessageWindow" -or $title -eq "MSCTFIME UI" -or $title -eq "Default IME") {
+          return $true
+        }
+        if (-not $visible -and -not $iconic -and -not $title -and ($width -lt 250 -or $height -lt 250)) {
+          return $true
+        }
+        $score = $area
+        if ($iconic) {
+          $score += 300000000
+        }
+        if ($titleHint -and $title.Contains($titleHint)) {
+          $score += 1000000000
+        }
+        if ($processHint -and $candidate.ProcessName.Contains($processHint)) {
+          $score += 500000000
+        }
+        if ((($width -ge 250 -and $height -ge 250) -or $iconic) -and $score -gt $script:selectedScore) {
+          $script:selectedScore = $score
           $script:selectedHandle = $hWnd
         }
       }
@@ -1688,18 +2276,66 @@ foreach ($name in $names) {
   }
 }
 $handle = $script:selectedHandle
+if ($handle -eq [IntPtr]::Zero) {
+  foreach ($name in $names) {
+    $procs = Get-Process -Name $name.Trim() -ErrorAction SilentlyContinue | Sort-Object StartTime -Descending
+    foreach ($candidate in $procs) {
+      if ($candidate.MainWindowHandle -ne 0) {
+        $handle = [IntPtr]$candidate.MainWindowHandle
+        break
+      }
+    }
+    if ($handle -ne [IntPtr]::Zero) { break }
+  }
+}
 if ($handle -eq [IntPtr]::Zero) { throw "Windows WeChat top-level window was not found." }
 if ($activate) {
-  [WeChatWindowInfoWin32]::ShowWindowAsync($handle, 9) | Out-Null
+  [WeChatWindowInfoWin32]::ShowWindowAsync($handle, 5) | Out-Null
+  if ([WeChatWindowInfoWin32]::IsIconic($handle)) {
+    [WeChatWindowInfoWin32]::ShowWindowAsync($handle, 9) | Out-Null
+  }
+  $foreground = [WeChatWindowInfoWin32]::GetForegroundWindow()
+  $currentThread = [WeChatWindowInfoWin32]::GetCurrentThreadId()
+  $targetPid = 0
+  $targetThread = [WeChatWindowInfoWin32]::GetWindowThreadProcessId($handle, [ref]$targetPid)
+  $foregroundPid = 0
+  $foregroundThread = 0
+  if ($foreground -ne [IntPtr]::Zero) {
+    $foregroundThread = [WeChatWindowInfoWin32]::GetWindowThreadProcessId($foreground, [ref]$foregroundPid)
+  }
+  $attachedTarget = $false
+  $attachedForeground = $false
+  if ($targetThread -ne 0 -and $targetThread -ne $currentThread) {
+    $attachedTarget = [WeChatWindowInfoWin32]::AttachThreadInput($currentThread, $targetThread, $true)
+  }
+  if ($foregroundThread -ne 0 -and $foregroundThread -ne $currentThread -and $foregroundThread -ne $targetThread) {
+    $attachedForeground = [WeChatWindowInfoWin32]::AttachThreadInput($currentThread, $foregroundThread, $true)
+  }
+  [WeChatWindowInfoWin32]::BringWindowToTop($handle) | Out-Null
   [WeChatWindowInfoWin32]::SetForegroundWindow($handle) | Out-Null
-  Start-Sleep -Milliseconds 180
+  [WeChatWindowInfoWin32]::SetActiveWindow($handle) | Out-Null
+  [WeChatWindowInfoWin32]::SetFocus($handle) | Out-Null
+  if ($attachedForeground) {
+    [WeChatWindowInfoWin32]::AttachThreadInput($currentThread, $foregroundThread, $false) | Out-Null
+  }
+  if ($attachedTarget) {
+    [WeChatWindowInfoWin32]::AttachThreadInput($currentThread, $targetThread, $false) | Out-Null
+  }
+  Start-Sleep -Milliseconds 220
 }
 $rect = New-Object WeChatWindowInfoWin32+RECT
 [WeChatWindowInfoWin32]::GetWindowRect($handle, [ref]$rect) | Out-Null
 "{0}`t{1}`t{2}`t{3}`t{4}" -f $handle.ToInt64(), $rect.Left, $rect.Top, ($rect.Right - $rect.Left), ($rect.Bottom - $rect.Top)
 '''
     try:
-        out = _win_powershell(script, _win_process_names(), "1" if activate else "0", timeout=8.0).strip()
+        out = _win_powershell(
+            script,
+            _win_process_names(),
+            "1" if activate else "0",
+            _WIN_WINDOW_TITLE_HINT,
+            _WIN_WINDOW_PROCESS_HINT,
+            timeout=8.0,
+        ).strip()
         handle, left, top, width, height = out.splitlines()[-1].split("\t")
         return WindowsWindowInfo(
             handle=int(handle),
@@ -1713,15 +2349,15 @@ $rect = New-Object WeChatWindowInfoWin32+RECT
 
 
 def _win_wechat_rect(standardize: bool = False) -> tuple[int, int, int, int]:
-    info = _win_wechat_window_info(activate=True)
+    info = _win_wechat_window_info(activate=not _win_visual_strategy_enabled())
     if standardize:
         mode = _win_standardize_mode()
         if mode == "visual_maximize":
             _win_click_visual_maximize_button()
-            info = _win_wechat_window_info(activate=True)
+            info = _win_wechat_window_info(activate=not _win_visual_strategy_enabled())
         elif mode in {"maximize", "workarea"}:
             _win_wechat_rect_legacy_standardize(mode)
-            info = _win_wechat_window_info(activate=True)
+            info = _win_wechat_window_info(activate=not _win_visual_strategy_enabled())
     return info.left, info.top, info.width, info.height
 
 
@@ -1768,10 +2404,12 @@ Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public class WeChatWin32 {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
   [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool repaint);
@@ -1779,6 +2417,7 @@ public class WeChatWin32 {
   public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 }
 "@
+[WeChatWin32]::SetProcessDPIAware() | Out-Null
 $names = $args[0] -split ','
 $standardize = $args[1] -eq '1'
 $standardizeMode = $args[2]
@@ -1798,7 +2437,7 @@ foreach ($name in $names) {
         $width = [Math]::Max(0, $rect.Right - $rect.Left)
         $height = [Math]::Max(0, $rect.Bottom - $rect.Top)
         $area = $width * $height
-        if ($width -ge 700 -and $height -ge 500 -and $area -gt $script:selectedArea) {
+        if ($width -ge 560 -and $height -ge 500 -and $area -gt $script:selectedArea) {
           $script:selectedArea = $area
           $script:selectedHandle = $hWnd
           $script:proc = $candidate
@@ -1814,7 +2453,9 @@ $proc = $script:proc
 $proc = $script:proc
 $handle = $script:selectedHandle
 if ($handle -eq [IntPtr]::Zero) { throw "找到微信进程但未找到顶层窗口，请先打开微信主窗口。" }
-[WeChatWin32]::ShowWindowAsync($handle, 9) | Out-Null
+if ([WeChatWin32]::IsIconic($handle)) {
+  [WeChatWin32]::ShowWindowAsync($handle, 9) | Out-Null
+}
 [WeChatWin32]::SetForegroundWindow($handle) | Out-Null
 Start-Sleep -Milliseconds 250
 if ($standardize) {
@@ -1841,9 +2482,19 @@ $rect = New-Object WeChatWin32+RECT
 
 
 def _win_activate_wechat() -> None:
+    if _win_visual_strategy_enabled():
+        _win_activate_wechat_visual_safe()
+        return
     try:
-        _win_wechat_rect(standardize=False)
+        _win_wechat_window_info(activate=True)
+        return
     except WeChatForegroundError as exc:
+        _win_launch_wechat_if_needed()
+        try:
+            _win_wechat_window_info(activate=True)
+            return
+        except WeChatForegroundError:
+            pass
         probe = _win_window_probe()
         if probe and sum(int(item.get("all_top_windows", 0)) for item in probe) == 0:
             raise WeChatForegroundError(
@@ -1854,8 +2505,470 @@ def _win_activate_wechat() -> None:
         raise
 
 
-def _win_open_search_deeplink(account_name: str) -> None:
-    if not _win_search_deeplink_enabled():
+def _win_activate_wechat_visual_safe() -> None:
+    """Verify an already-frontmost WeChat window without Win32 focus APIs.
+
+    Windows WeChat can white-screen when driven with SetForegroundWindow,
+    AttachThreadInput, SetFocus, or synthetic window messages. The visual path
+    therefore avoids taskbar/tray clicks too. The user or the surrounding
+    desktop controller must put WeChat in front before this Python collector
+    starts issuing real mouse clicks.
+    """
+    info: WindowsWindowInfo | None = None
+    try:
+        info = _win_wechat_window_info(activate=False)
+    except WeChatForegroundError as exc:
+        raise WeChatForegroundError(
+            "Windows visual 模式没有找到已登录微信主窗口句柄；为避免误点任务栏/托盘，已停止自动接管。"
+        ) from exc
+
+    if info and _win_foreground_handle() == info.handle:
+        _win_assert_renderable("windows", "after_window_restore_foreground")
+        return
+
+    if _win_window_info_looks_minimized(info):
+        raise WeChatForegroundError(
+            "Windows visual 模式检测到微信主窗口最小化；为避免 Win32 恢复触发微信白屏，已停止自动接管。"
+        )
+    foreground_process = _win_foreground_process_name()
+    if not _win_process_name_is_wechat(foreground_process):
+        raise WeChatForegroundError(
+            "Windows visual 模式要求微信主窗口已经在前台；当前前台不是微信，已停止操作以避免误点其它窗口。"
+        )
+    _win_assert_renderable("windows", "after_window_restore_foreground")
+
+
+def _win_foreground_handle() -> int:
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    return int(user32.GetForegroundWindow() or 0)
+
+
+def _win_window_info_for_handle(handle: int) -> WindowsWindowInfo:
+    import ctypes
+    from ctypes import wintypes
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    user32 = ctypes.windll.user32
+    user32.IsWindow.argtypes = [ctypes.c_void_p]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    if not user32.IsWindow(ctypes.c_void_p(handle)):
+        raise WeChatForegroundError(f"Windows window handle no longer exists: {handle}")
+    rect = RECT()
+    if not user32.GetWindowRect(ctypes.c_void_p(handle), ctypes.byref(rect)):
+        raise WeChatForegroundError(f"Windows failed to read window bounds: {handle}")
+    return WindowsWindowInfo(
+        handle=handle,
+        left=int(rect.left),
+        top=int(rect.top),
+        width=int(rect.right - rect.left),
+        height=int(rect.bottom - rect.top),
+    )
+
+
+def _win_window_process_name_for_handle(handle: int) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(ctypes.c_void_p(handle), ctypes.byref(pid))
+    if not pid.value:
+        return ""
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not process:
+        return ""
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        if not kernel32.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(size)):
+            return ""
+        return Path(buffer.value).stem
+    finally:
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(process)
+
+
+def _win_window_title_for_handle(handle: int) -> str:
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    length = max(0, int(user32.GetWindowTextLengthW(ctypes.c_void_p(handle))))
+    buffer = ctypes.create_unicode_buffer(length + 2)
+    user32.GetWindowTextW(ctypes.c_void_p(handle), buffer, len(buffer))
+    return buffer.value.strip()
+
+
+def _win_assert_wechat_window_handle(handle: int, purpose: str) -> None:
+    process_name = _win_window_process_name_for_handle(handle)
+    if not _win_process_name_is_wechat(process_name):
+        raise WeChatForegroundError(
+            f"Windows visual 模式拒绝操作非微信窗口({purpose}): handle={handle}, process={process_name or 'unknown'}"
+        )
+
+
+def _win_focus_known_window(handle: int) -> None:
+    _win_assert_wechat_window_handle(handle, "focus")
+    info = _win_window_info_for_handle(handle)
+    if _win_window_info_looks_minimized(info):
+        raise WeChatForegroundError(
+            "Windows visual 模式不会用 Win32 API 恢复最小化窗口，避免触发微信白屏。"
+        )
+    _win_raise_window_without_focus_api(handle)
+    _sleep(0.2, 0.05)
+    if _win_foreground_handle() != handle and not _win_window_info_looks_minimized(info):
+        title_x = info.left + min(max(info.width * 0.5, 80), max(info.width - 80, 80))
+        _win_click_point(title_x, info.top + 18)
+        _sleep(0.25, 0.05)
+    if _win_foreground_handle() != handle:
+        raise WeChatForegroundError(
+            "Windows visual 模式无法聚焦已知微信窗口，已停止以避免误操作其它窗口。"
+        )
+
+
+def _win_close_known_window(handle: int) -> None:
+    _win_assert_wechat_window_handle(handle, "close")
+    info = _win_window_info_for_handle(handle)
+    _win_focus_known_window(handle)
+    # Click this specific window's title-bar close button instead of sending
+    # Ctrl+W globally; this prevents closing Codex/VS Code when focus drifts.
+    close_x = info.left + info.width - 18
+    close_y = info.top + 18
+    _win_click_point(close_x, close_y)
+
+
+def _win_window_info_looks_minimized(info: WindowsWindowInfo) -> bool:
+    return info.left <= -30000 or info.top <= -30000 or info.width < 300 or info.height < 120
+
+
+def _win_restore_window_without_focus_api(handle: int) -> None:
+    """Unsafe legacy helper; do not call from Windows visual mode."""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.ShowWindowAsync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user32.ShowWindowAsync.restype = ctypes.c_bool
+    user32.ShowWindowAsync(ctypes.c_void_p(handle), 9)
+
+
+def _win_restore_and_maximize_without_focus_api(handle: int) -> None:
+    """Unsafe legacy helper; do not call from Windows visual mode."""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.ShowWindowAsync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user32.ShowWindowAsync.restype = ctypes.c_bool
+    hwnd = ctypes.c_void_p(handle)
+    user32.ShowWindowAsync(hwnd, 9)
+    _sleep(0.25, 0.05)
+    user32.ShowWindowAsync(hwnd, 3)
+
+
+def _win_raise_window_without_focus_api(handle: int) -> None:
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.SetWindowPos.restype = ctypes.c_bool
+    hwnd_top = ctypes.c_void_p(0)
+    swp_nomove = 0x0002
+    swp_nosize = 0x0001
+    swp_noactivate = 0x0010
+    swp_showwindow = 0x0040
+    user32.SetWindowPos(
+        ctypes.c_void_p(handle),
+        hwnd_top,
+        0,
+        0,
+        0,
+        0,
+        swp_nomove | swp_nosize | swp_noactivate | swp_showwindow,
+    )
+
+
+def _win_click_taskbar_wechat_icon() -> bool:
+    detected = _win_detect_taskbar_wechat_icon_point_pil()
+    if detected:
+        _win_click_point(*detected)
+        return True
+
+    detected = _win_detect_taskbar_wechat_icon_point()
+    if detected:
+        _win_click_point(*detected)
+        return True
+
+    detected = _win_detect_taskbar_wechat_button_point()
+    if detected:
+        _win_click_point(*detected)
+        return True
+
+    point = os.getenv("WECHAT_WINDOWS_TASKBAR_POINT", "").strip()
+    if point:
+        try:
+            x_raw, y_raw = [part.strip() for part in point.split(",", 1)]
+            _win_click_point(float(x_raw), float(y_raw))
+            return True
+        except Exception:
+            raise WeChatForegroundError(
+                "WECHAT_WINDOWS_TASKBAR_POINT 格式应为 x,y，例如 890,1120。"
+            )
+
+    return False
+
+
+def _win_detect_taskbar_wechat_icon_point_pil() -> tuple[int, int] | None:
+    """Locate the taskbar WeChat icon from a real desktop screenshot."""
+    try:
+        from PIL import ImageGrab
+    except Exception:
+        return None
+
+    try:
+        try:
+            image = ImageGrab.grab(all_screens=True)
+        except TypeError:
+            image = ImageGrab.grab()
+    except Exception:
+        return None
+
+    if not image:
+        return None
+
+    width, height = image.size
+    if width < 200 or height < 120:
+        return None
+
+    rgb = image.convert("RGB")
+    y_start = max(0, height - max(96, int(height * 0.12)))
+    y_end = height - 1
+    step = 2
+    x_scores: list[int] = [0] * width
+    y_weighted: list[int] = [0] * width
+
+    sampled = 0
+    green_pixels = 0
+    for x in range(0, width, step):
+        count = 0
+        y_sum = 0
+        for y in range(y_start, y_end + 1, step):
+            sampled += 1
+            r, g, b = rgb.getpixel((x, y))
+            # WeChat's taskbar icon is the most saturated green object in this band.
+            if g >= 100 and r <= 160 and b <= 190 and (g - r) >= 10 and (g - b) >= 5:
+                count += 1
+                y_sum += y
+        x_scores[x] = count
+        y_weighted[x] = y_sum
+        green_pixels += count
+
+    if sampled <= 0 or green_pixels < 12:
+        return None
+
+    groups: list[tuple[int, int, int, int, int]] = []
+    in_group = False
+    start = 0
+    total = 0
+    weighted_x = 0
+    weighted_y = 0
+    # Do not scan the tray/status area: clicking the tray WeChat icon can hide
+    # or toggle it instead of restoring the main WeChat window.
+    max_usable_x = int(width * 0.75)
+    min_column_score = 2
+
+    for x in range(0, max_usable_x, step):
+        score = x_scores[x]
+        if score >= min_column_score:
+            if not in_group:
+                in_group = True
+                start = x
+                total = 0
+                weighted_x = 0
+                weighted_y = 0
+            total += score
+            weighted_x += x * score
+            weighted_y += y_weighted[x]
+        elif in_group:
+            end = x
+            if (end - start) >= 8 and total >= 10:
+                groups.append((total, start, end, weighted_x, weighted_y))
+            in_group = False
+
+    if in_group:
+        end = max_usable_x
+        if (end - start) >= 8 and total >= 10:
+            groups.append((total, start, end, weighted_x, weighted_y))
+
+    if not groups:
+        return None
+
+    total, _start, _end, weighted_x, weighted_y = sorted(groups, reverse=True)[0]
+    center_x = int(weighted_x / max(1, total))
+    center_y = int(weighted_y / max(1, total))
+    virtual_left, virtual_top, virtual_width, virtual_height = _win_virtual_screen_bounds()
+    if (width, height) == (virtual_width, virtual_height):
+        return virtual_left + center_x, virtual_top + center_y
+    mapped_x = virtual_left + int(center_x * virtual_width / max(1, width))
+    mapped_y = virtual_top + int(center_y * virtual_height / max(1, height))
+    return mapped_x, mapped_y
+
+
+def _win_detect_taskbar_wechat_icon_point() -> tuple[int, int] | None:
+    script = r'''
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+$graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bounds.Size)
+$graphics.Dispose()
+$yStart = [Math]::Max(0, $bounds.Height - 96)
+$yEnd = $bounds.Height - 1
+$scores = New-Object int[] $bounds.Width
+for ($x = 0; $x -lt $bounds.Width; $x += 2) {
+  $count = 0
+  for ($y = $yStart; $y -le $yEnd; $y += 2) {
+    $c = $bitmap.GetPixel($x, $y)
+    if ($c.G -ge 135 -and $c.R -le 95 -and $c.B -ge 45 -and $c.B -le 165 -and ($c.G - $c.R) -ge 55) {
+      $count += 1
+    }
+  }
+  $scores[$x] = $count
+}
+$bitmap.Dispose()
+$groups = @()
+$inGroup = $false
+$start = 0
+$sum = 0
+$weighted = 0
+$maxUsableX = [int]($bounds.Width * 0.92)
+for ($x = 0; $x -lt $maxUsableX; $x += 2) {
+  $score = $scores[$x]
+  if ($score -ge 5) {
+    if (-not $inGroup) {
+      $inGroup = $true
+      $start = $x
+      $sum = 0
+      $weighted = 0
+    }
+    $sum += $score
+    $weighted += ($x * $score)
+  } elseif ($inGroup) {
+    $end = $x
+    if (($end - $start) -ge 12 -and $sum -ge 20) {
+      $center = [int]($weighted / [Math]::Max(1, $sum))
+      $groups += [pscustomobject]@{Center=$center; Score=$sum; Width=($end - $start)}
+    }
+    $inGroup = $false
+  }
+}
+if ($groups.Count -eq 0) { exit 0 }
+$chosen = $groups | Sort-Object Score -Descending | Select-Object -First 1
+$screenX = $bounds.Left + $chosen.Center
+$screenY = $bounds.Top + $bounds.Height - 34
+"{0}`t{1}" -f $screenX, $screenY
+'''
+    try:
+        out = _win_powershell(script, timeout=8.0).strip()
+    except Exception:
+        return None
+    if not out:
+        return None
+    try:
+        x_raw, y_raw = out.splitlines()[-1].split("\t")
+        return int(x_raw), int(y_raw)
+    except ValueError:
+        return None
+
+
+def _win_detect_taskbar_wechat_button_point() -> tuple[int, int] | None:
+    """Locate WeChat on the Windows taskbar through accessibility metadata."""
+    script = r'''
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$condition = [System.Windows.Automation.Condition]::TrueCondition
+$nodes = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$candidates = @()
+$wechatText = ([string][char]0x5fae) + ([string][char]0x4fe1)
+foreach ($node in $nodes) {
+  try {
+    $name = $node.Current.Name
+    if ([string]::IsNullOrWhiteSpace($name)) { continue }
+    if (-not ($name.Contains($wechatText) -or $name -match "Weixin|WeChat")) { continue }
+    $rect = $node.Current.BoundingRectangle
+    if ($rect.Width -le 0 -or $rect.Height -le 0) { continue }
+    $score = 0
+    if ($rect.Top -ge ($bounds.Top + $bounds.Height - 120)) { $score += 1000 }
+    if ($rect.Width -le 220 -and $rect.Height -le 100) { $score += 200 }
+    if ($name -eq $wechatText -or $name -match "^Weixin$|^WeChat$") { $score += 100 }
+    $candidates += [pscustomobject]@{
+      Score=$score
+      X=[int]($rect.Left + ($rect.Width / 2))
+      Y=[int]($rect.Top + ($rect.Height / 2))
+      Name=$name
+    }
+  } catch {}
+}
+if ($candidates.Count -eq 0) { exit 0 }
+$chosen = $candidates | Sort-Object Score -Descending | Select-Object -First 1
+"{0}`t{1}`t{2}" -f $chosen.X, $chosen.Y, $chosen.Name
+'''
+    try:
+        out = _win_powershell(script, timeout=10.0).strip()
+    except Exception:
+        return None
+    if not out:
+        return None
+    try:
+        x_raw, y_raw, *_ = out.splitlines()[-1].split("\t")
+        return int(x_raw), int(y_raw)
+    except ValueError:
+        return None
+
+
+def _win_open_search_deeplink(account_name: str, force: bool = False) -> None:
+    if not force and not _win_search_deeplink_enabled():
         print(
             "[wechat_foreground] Windows search deeplink skipped; "
             "set WECHAT_WINDOWS_ENABLE_DEEPLINK=1 after allowing foreground control.",
@@ -1886,13 +2999,113 @@ def _win_visual_strategy_enabled() -> bool:
 def _win_prepare_visual_step(stage: str) -> None:
     if not _win_visual_strategy_enabled():
         return
-    _win_activate_wechat()
-    if os.getenv("WECHAT_WINDOWS_VISUAL_MAXIMIZE_EACH_STEP", "1").strip() == "1":
-        _win_click_visual_maximize_button()
+    _win_wechat_window_info(activate=False)
+    if os.getenv("WECHAT_WINDOWS_VISUAL_MAXIMIZE_EACH_STEP", "0").strip() == "1":
+        _win_ensure_visual_maximized_once(stage)
     _win_assert_renderable("windows", f"visual_{stage}")
 
 
+def _win_set_window_title_hint(title_hint: str) -> None:
+    global _WIN_WINDOW_TITLE_HINT
+    _WIN_WINDOW_TITLE_HINT = title_hint.strip()
+
+
+def _win_set_window_process_hint(process_hint: str) -> None:
+    global _WIN_WINDOW_PROCESS_HINT
+    _WIN_WINDOW_PROCESS_HINT = process_hint.strip()
+
+
+def _win_reset_visual_session() -> None:
+    global _WIN_VISUAL_MAXIMIZE_ATTEMPTED
+    _WIN_VISUAL_MAXIMIZE_ATTEMPTED = False
+
+
+def _win_ensure_initial_visual_maximized(account_name: str = "", verify_renderable: bool = True) -> None:
+    """The visual path starts only after the existing WeChat window is maximized."""
+    if not _win_visual_strategy_enabled():
+        return
+    info = _win_wechat_window_info(activate=False)
+    _win_assert_wechat_window_handle(info.handle, "initial visual fullscreen check")
+    if _win_window_info_looks_minimized(info):
+        raise WeChatForegroundError(
+            "Windows visual mode found WeChat minimized before search; refusing to continue."
+        )
+    if not _win_window_looks_maximized(info):
+        _win_ensure_visual_maximized_once("initial")
+        _sleep(_win_env_float("WECHAT_WINDOWS_AFTER_INITIAL_MAXIMIZE_WAIT", 0.35), 0.08)
+    refreshed = _win_wechat_window_info(activate=False)
+    if not _win_window_looks_maximized(refreshed):
+        raise WeChatForegroundError(
+            "Windows visual mode could not maximize WeChat before search; refusing to continue."
+        )
+    _win_focus_known_window(refreshed.handle)
+    if verify_renderable:
+        _win_assert_renderable(account_name or "windows", "visual_initial_maximized")
+
+
+def _win_ensure_foreground_visual_maximized(account_name: str = "", verify_renderable: bool = True) -> None:
+    handle = _win_foreground_handle()
+    if not handle:
+        raise WeChatForegroundError("Windows visual mode found no foreground window before search.")
+    _win_assert_wechat_window_handle(handle, "foreground visual fullscreen check")
+    info = _win_window_info_for_handle(handle)
+    if _win_window_info_looks_minimized(info):
+        raise WeChatForegroundError(
+            "Windows visual mode found foreground WeChat minimized before search; refusing to continue."
+        )
+    if info.width < 900 or info.height < 650:
+        raise WeChatForegroundError(
+            "Windows visual mode found a small foreground WeChat popup before search; refusing to maximize it."
+        )
+    if not _win_window_looks_maximized(info):
+        _win_click_visual_maximize_button_for_info(info)
+        _sleep(_win_env_float("WECHAT_WINDOWS_AFTER_INITIAL_MAXIMIZE_WAIT", 0.35), 0.08)
+    refreshed = _win_window_info_for_handle(handle)
+    if not _win_window_looks_maximized(refreshed):
+        raise WeChatForegroundError(
+            "Windows visual mode could not maximize the foreground WeChat window before search."
+        )
+    _win_focus_known_window(handle)
+    if verify_renderable:
+        _win_assert_renderable(account_name or "windows", "visual_foreground_maximized")
+
+
+def _win_ensure_visual_maximized_once(stage: str = "") -> None:
+    """Avoid toggling a maximized WeChat window back to restored size."""
+    global _WIN_VISUAL_MAXIMIZE_ATTEMPTED
+    info = _win_wechat_window_info(activate=False)
+    if _win_window_looks_maximized(info):
+        return
+    if _WIN_VISUAL_MAXIMIZE_ATTEMPTED:
+        print(
+            f"[wechat_foreground] Windows visual maximize already attempted; "
+            f"skip repeated title-bar click at {stage} to avoid restoring WeChat.",
+            flush=True,
+        )
+        return
+    _WIN_VISUAL_MAXIMIZE_ATTEMPTED = True
+    _win_click_visual_maximize_button()
+
+
+def _win_ensure_visual_maximized_for_search() -> None:
+    """Search coordinates are only stable after WeChat is maximized."""
+    if not _win_visual_strategy_enabled():
+        return
+    info = _win_wechat_window_info(activate=False)
+    if _win_window_looks_maximized(info):
+        return
+    if _win_window_info_looks_minimized(info):
+        raise WeChatForegroundError("Windows 微信搜索前窗口处于最小化，已停止以避免 API 恢复触发白屏。")
+    _win_click_visual_maximize_button()
+    _sleep(0.6, 0.12)
+    refreshed = _win_wechat_window_info(activate=False)
+    if not _win_window_looks_maximized(refreshed):
+        raise WeChatForegroundError("Windows 微信搜索前未能最大化，停止操作以避免坐标漂移。")
+
+
 def _win_standardize_wechat_window() -> None:
+    if _win_visual_strategy_enabled():
+        return
     if os.getenv("WECHAT_WINDOWS_SKIP_STANDARDIZE", "").strip() == "1":
         _win_activate_wechat()
         return
@@ -1931,20 +3144,26 @@ def _win_standardize_mode() -> str:
 
 def _win_click_visual_maximize_button() -> None:
     """Maximize by clicking the visible title-bar button, avoiding white-screen MoveWindow paths."""
-    info = _win_wechat_window_info(activate=True)
-    if _win_window_is_maximized(info.handle):
+    info = _win_wechat_window_info(activate=False)
+    if _win_window_looks_maximized(info):
+        return
+    _win_click_visual_maximize_button_for_info(info)
+
+
+def _win_click_visual_maximize_button_for_info(info: WindowsWindowInfo) -> None:
+    if _win_window_looks_maximized(info):
         return
 
     # WeChat uses a normal top-right title-bar cluster. The maximize button is
     # the middle of minimize/maximize/close and stays stable after activation.
     right = info.left + info.width
-    x = right - _win_env_int("WECHAT_WINDOWS_MAXIMIZE_BUTTON_RIGHT_OFFSET", 52)
+    x = right - _win_env_int("WECHAT_WINDOWS_MAXIMIZE_BUTTON_RIGHT_OFFSET", 78)
     y = info.top + _win_env_int("WECHAT_WINDOWS_MAXIMIZE_BUTTON_TOP_OFFSET", 18)
     _win_click_point(x, y)
     _sleep(0.55, 0.1)
 
-    refreshed = _win_wechat_window_info(activate=True)
-    if not _win_window_is_maximized(refreshed.handle):
+    refreshed = _win_wechat_window_info(activate=False)
+    if not _win_window_looks_maximized(refreshed):
         print(
             "[wechat_foreground] Windows visual maximize did not change the WeChat window; "
             "skip API maximize to avoid triggering a WeChat white screen.",
@@ -1959,11 +3178,76 @@ def _win_maximize_window(handle: int) -> None:
     user32 = ctypes.windll.user32
     user32.ShowWindowAsync.argtypes = [ctypes.c_void_p, ctypes.c_int]
     user32.ShowWindowAsync.restype = ctypes.c_bool
-    user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
-    user32.SetForegroundWindow.restype = ctypes.c_bool
     hwnd = ctypes.c_void_p(handle)
     user32.ShowWindowAsync(hwnd, 3)
-    user32.SetForegroundWindow(hwnd)
+    _win_force_foreground_handle(handle)
+
+
+def _win_force_foreground_handle(handle: int) -> bool:
+    """Best-effort foreground activation that survives VSCode/terminal launch context."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    hwnd = ctypes.c_void_p(handle)
+
+    user32.IsIconic.argtypes = [ctypes.c_void_p]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.ShowWindowAsync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user32.ShowWindowAsync.restype = wintypes.BOOL
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    kernel32.GetCurrentThreadId.argtypes = []
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
+    user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
+    user32.BringWindowToTop.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.SetActiveWindow.argtypes = [ctypes.c_void_p]
+    user32.SetActiveWindow.restype = ctypes.c_void_p
+    user32.SetFocus.argtypes = [ctypes.c_void_p]
+    user32.SetFocus.restype = ctypes.c_void_p
+
+    user32.ShowWindowAsync(hwnd, 5)
+    if user32.IsIconic(hwnd):
+        user32.ShowWindowAsync(hwnd, 9)
+        time.sleep(0.12)
+
+    current_thread = kernel32.GetCurrentThreadId()
+    target_pid = wintypes.DWORD(0)
+    target_thread = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(target_pid))
+    foreground = user32.GetForegroundWindow()
+    foreground_thread = 0
+    if foreground:
+        foreground_pid = wintypes.DWORD(0)
+        foreground_thread = user32.GetWindowThreadProcessId(
+            ctypes.c_void_p(foreground), ctypes.byref(foreground_pid)
+        )
+
+    attached_target = False
+    attached_foreground = False
+    try:
+        if target_thread and target_thread != current_thread:
+            attached_target = bool(user32.AttachThreadInput(current_thread, target_thread, True))
+        if foreground_thread and foreground_thread not in (current_thread, target_thread):
+            attached_foreground = bool(user32.AttachThreadInput(current_thread, foreground_thread, True))
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        user32.SetActiveWindow(hwnd)
+        user32.SetFocus(hwnd)
+        time.sleep(0.12)
+    finally:
+        if attached_foreground:
+            user32.AttachThreadInput(current_thread, foreground_thread, False)
+        if attached_target:
+            user32.AttachThreadInput(current_thread, target_thread, False)
+
+    return user32.GetForegroundWindow() == handle
 
 
 def _win_window_is_maximized(handle: int) -> bool:
@@ -1973,6 +3257,59 @@ def _win_window_is_maximized(handle: int) -> bool:
     user32.IsZoomed.argtypes = [ctypes.c_void_p]
     user32.IsZoomed.restype = ctypes.c_bool
     return bool(user32.IsZoomed(ctypes.c_void_p(handle)))
+
+
+def _win_window_looks_maximized(info: WindowsWindowInfo) -> bool:
+    if _win_window_is_maximized(info.handle):
+        return True
+    try:
+        work_left, work_top, work_width, work_height = _win_window_work_area(info.handle)
+    except Exception:
+        return False
+    # On mixed-DPI multi-monitor setups, GetWindowRect and monitor work-area
+    # coordinates can be reported in different coordinate spaces. Size is more
+    # reliable than the absolute top-left position for detecting maximized
+    # WeChat, and avoids clicking the title-bar button again, which would
+    # restore the window to its previous size.
+    width_ok = info.width >= int(work_width * 0.95)
+    height_ok = info.height >= int(work_height * 0.95)
+    return width_ok and height_ok
+
+
+def _win_window_work_area(handle: int) -> tuple[int, int, int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", RECT),
+            ("rcWork", RECT),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    user32 = ctypes.windll.user32
+    user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    user32.MonitorFromWindow.restype = ctypes.c_void_p
+    user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
+    monitor = user32.MonitorFromWindow(ctypes.c_void_p(handle), 2)
+    if not monitor:
+        raise WeChatForegroundError("Windows monitor for WeChat was not found.")
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        raise WeChatForegroundError("Windows monitor work area was not available.")
+    rect = info.rcWork
+    return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
 
 
 def _win_screen_size() -> tuple[int, int]:
@@ -2004,24 +3341,20 @@ def _win_click_window(rel_x: float, rel_y_from_top: float) -> None:
 
 def _win_click_client(handle: int, x: int, y: int) -> None:
     import ctypes
+    from ctypes import wintypes
 
     user32 = ctypes.windll.user32
-    user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
-    user32.SetForegroundWindow.restype = ctypes.c_bool
-    user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_size_t]
-    user32.PostMessageW.restype = ctypes.c_bool
-    hwnd = ctypes.c_void_p(handle)
-    lparam = ((int(y) & 0xFFFF) << 16) | (int(x) & 0xFFFF)
-    user32.SetForegroundWindow(hwnd)
-    time.sleep(0.05)
-    user32.PostMessageW(hwnd, 0x0201, 0x0001, lparam)
-    time.sleep(0.04)
-    user32.PostMessageW(hwnd, 0x0202, 0x0000, lparam)
+    user32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.POINT)]
+    user32.ClientToScreen.restype = wintypes.BOOL
+    point = wintypes.POINT(int(x), int(y))
+    if not user32.ClientToScreen(ctypes.c_void_p(handle), ctypes.byref(point)):
+        raise WeChatForegroundError("Windows failed to convert WeChat client coordinates to screen coordinates.")
+    _win_click_point(point.x, point.y)
 
 
 def _win_click_search_box_by_client_message() -> bool:
-    info = _win_wechat_window_info(activate=True)
-    points = _win_point_sequence(
+    info = _win_wechat_window_info(activate=False)
+    points = _win_client_point_sequence(
         "WECHAT_WINDOWS_SEARCH_CLIENT_POINTS",
         "200,55;180,55;240,55",
     )
@@ -2063,6 +3396,12 @@ def _win_press(vk: int) -> None:
 
 
 def _win_paste_text(text: str) -> None:
+    if not _win_visual_strategy_enabled():
+        try:
+            info = _win_wechat_window_info(activate=True)
+            _win_force_foreground_handle(info.handle)
+        except WeChatForegroundError:
+            pass
     _win_set_clipboard(text)
     _sleep(0.15, 0.03)
     _win_hotkey(0x11, 0x41)
@@ -2158,7 +3497,7 @@ foreach ($name in $names) {
         $width = [Math]::Max(0, $rect.Right - $rect.Left)
         $height = [Math]::Max(0, $rect.Bottom - $rect.Top)
         $area = $width * $height
-        if ($width -ge 700 -and $height -ge 500 -and $area -gt $script:selectedArea) {
+        if ($width -ge 560 -and $height -ge 500 -and $area -gt $script:selectedArea) {
           $script:selectedArea = $area
           $script:handle = $hWnd
           $script:proc = $candidate
@@ -2215,8 +3554,17 @@ foreach ($node in $nodes) {
 
 
 def _win_search_account(account_name: str) -> None:
-    _win_press(0x1B)
-    _sleep(0.15, 0.03)
+    _win_set_window_title_hint("")
+    _win_set_window_process_hint("Weixin")
+    if _win_visual_strategy_enabled():
+        _win_open_main_chat_tab_visual()
+        _win_click_search_box_by_client_message()
+        _sleep(0.12, 0.03)
+        _win_paste_text(account_name)
+        return
+    if not _win_visual_strategy_enabled():
+        _win_press(0x1B)
+        _sleep(0.15, 0.03)
     search = _win_find_top_left_search_placeholder()
     if search:
         _win_click_norm(search.cx, search.cy)
@@ -2227,23 +3575,148 @@ def _win_search_account(account_name: str) -> None:
 
 
 def _win_open_account_result(account_name: str) -> bool:
+    if _win_visual_strategy_enabled():
+        attempts: list[tuple[str, tuple[float, float]]] = []
+        result = _win_find_account_result(account_name)
+        if result:
+            attempts.append(("norm", (result.cx, result.cy)))
+        attempts.extend(("client", (float(x), float(y))) for x, y in _win_search_result_client_points())
+
+        seen: set[tuple[str, int, int]] = set()
+        for index, (kind, point) in enumerate(attempts):
+            key = (kind, int(point[0] * 10000) if kind == "norm" else int(point[0]), int(point[1] * 10000) if kind == "norm" else int(point[1]))
+            if key in seen:
+                continue
+            seen.add(key)
+            if index:
+                _win_search_account(account_name)
+                _sleep(_win_env_float("WECHAT_WINDOWS_AFTER_SEARCH_WAIT", 0.65), 0.1)
+            if kind == "norm":
+                _win_click_norm(point[0], point[1])
+            else:
+                info = _win_wechat_window_info(activate=False)
+                _win_click_client(info.handle, int(point[0]), int(point[1]))
+            _sleep(0.85, 0.15)
+            if _win_opened_expected_account_result(account_name):
+                return True
+            _win_recover_after_wrong_account_result()
+        return False
     for _ in range(4):
         result = _win_find_account_result(account_name)
         if result:
             _win_click_norm(result.cx, result.cy)
+            if _win_visual_strategy_enabled():
+                return True
             _sleep(0.2, 0.05)
             _win_click_norm(result.cx, result.cy)
             return True
         _sleep(0.5, 0.1)
 
-    _win_click_window(_win_env_float("WECHAT_WINDOWS_RESULT_X", 0.20), _win_env_float("WECHAT_WINDOWS_RESULT_Y", 0.235))
-    _sleep(0.2, 0.05)
-    _win_press(0x0D)
+    # Windows WeChat exposes the global search results as a narrow left panel.
+    # In mixed-DPI multi-monitor setups, full-window relative screen clicks can
+    # drift badly. Client coordinates are stable here because the search box was
+    # also focused through the same message path.
+    _win_click_search_result_by_client_message()
     return True
+
+
+def _win_click_search_result_by_client_message() -> None:
+    info = _win_wechat_window_info(activate=False)
+    points = _win_search_result_client_points()
+    if points:
+        x, y = points[0]
+        _win_click_client(info.handle, int(x), int(y))
+        _sleep(0.18, 0.04)
+    _sleep(0.8, 0.15)
+
+
+def _win_search_result_client_points() -> list[tuple[int, int]]:
+    return _win_client_point_sequence(
+        "WECHAT_WINDOWS_RESULT_CLIENT_POINTS",
+        "185,238;185,405;205,405;165,405;185,545;205,545;165,545",
+    )
+
+
+def _win_opened_expected_account_result(account_name: str) -> bool:
+    handle = _win_foreground_handle()
+    if not handle:
+        return False
+    try:
+        _win_assert_wechat_window_handle(handle, "account result validation")
+    except WeChatForegroundError:
+        return False
+    main_handle = 0
+    try:
+        main_handle = _win_choose_existing_wechat_window_handle()
+    except Exception:
+        main_handle = 0
+    if main_handle and handle == main_handle:
+        return False
+
+    title = _win_window_title_for_handle(handle)
+    visible = " | ".join(item.text for item in _win_texts())
+    haystack = f"{title} | {visible}".lower()
+    query = account_name.lower()
+    bad_markers = ("搜一搜", "搜索网络结果", "搜索聊天记录", "聊天记录", "Search chat history")
+    if any(marker.lower() in haystack for marker in bad_markers):
+        return False
+    return query in haystack or "公众号" in haystack
+
+
+def _win_recover_after_wrong_account_result() -> None:
+    handle = _win_foreground_handle()
+    main_handle = 0
+    try:
+        main_handle = _win_choose_existing_wechat_window_handle()
+    except Exception:
+        main_handle = 0
+    if handle and main_handle and handle != main_handle:
+        try:
+            _win_close_known_window(handle)
+            _sleep(0.45, 0.08)
+        except WeChatForegroundError:
+            pass
+    if main_handle:
+        try:
+            _win_focus_known_window(main_handle)
+        except WeChatForegroundError:
+            pass
+    _win_press(0x1B)
+    _sleep(0.2, 0.05)
+
+
+def _win_looks_like_chat_history_search_popup() -> bool:
+    visible = " | ".join(item.text for item in _win_texts())
+    return any(marker in visible for marker in ("搜索聊天记录", "搜尋聊天記錄", "Search chat history"))
+
+
+def _win_open_main_chat_tab_visual() -> None:
+    info = _win_wechat_window_info(activate=False)
+    if info.width < 900:
+        return
+    points = _win_client_point_sequence(
+        "WECHAT_WINDOWS_CHAT_TAB_CLIENT_POINTS",
+        "36,96;36,72",
+    )
+    for x, y in points[:1]:
+        _win_click_client(info.handle, int(x), int(y))
+        _sleep(0.12, 0.03)
+
+
+def _win_mark_account_window(account_name: str) -> None:
+    _win_set_window_title_hint(account_name)
+    _win_set_window_process_hint("Weixin")
 
 
 def _win_ensure_full_account_home(account_name: str, soft: bool = False) -> None:
     if _win_looks_like_full_account_home(account_name):
+        return
+    if _win_visual_strategy_enabled():
+        _win_open_full_account_home_visual(account_name)
+        if not _win_looks_like_full_account_home(account_name):
+            if soft:
+                return
+            raise WeChatForegroundError(f"Windows 未确认进入公众号完整主页: {account_name}")
         return
     for x, y in _win_point_sequence("WECHAT_WINDOWS_HOME_POINTS", "0.955,0.075;0.930,0.115;0.500,0.180"):
         _win_click_window(x, y)
@@ -2252,6 +3725,31 @@ def _win_ensure_full_account_home(account_name: str, soft: bool = False) -> None
             return
     if not soft:
         print("[wechat_foreground] Windows 未确认进入完整主页，继续使用当前页面尝试采集。", flush=True)
+
+
+def _win_open_full_account_home_visual(account_name: str, soft: bool = False) -> None:
+    handle = _win_foreground_handle() or _win_wechat_window_info(activate=False).handle
+    _win_assert_wechat_window_handle(handle, "account profile")
+    info = _win_window_info_for_handle(handle)
+    if _win_window_info_looks_minimized(info):
+        raise WeChatForegroundError("Windows 公众号浮层最小化，无法进入完整主页。")
+
+    points = _win_client_point_sequence(
+        "WECHAT_WINDOWS_ACCOUNT_PROFILE_CLIENT_POINTS",
+        f"{max(24, info.width - _win_env_int('WECHAT_WINDOWS_ACCOUNT_PROFILE_RIGHT_OFFSET', 38))},"
+        f"{_win_env_int('WECHAT_WINDOWS_ACCOUNT_PROFILE_TOP_OFFSET', 64)};"
+        f"{max(24, info.width - 52)},{_win_env_int('WECHAT_WINDOWS_ACCOUNT_PROFILE_TOP_OFFSET', 64)}",
+    )
+    for x, y in points:
+        _win_click_client(handle, int(x), int(y))
+        _sleep(_win_env_float("WECHAT_WINDOWS_AFTER_PROFILE_CLICK_WAIT", 0.9), 0.18)
+        if _win_looks_like_full_account_home(account_name):
+            return
+        current = _win_window_info_for_handle(_win_foreground_handle() or handle)
+        if current.width >= info.width + 80 or current.height >= info.height + 120:
+            return
+    if not soft:
+        print("[wechat_foreground] Windows 未确认进入公众号完整主页，继续使用当前页面尝试采集。", flush=True)
 
 
 def _win_looks_like_full_account_home(account_name: str = "") -> bool:
@@ -2304,6 +3802,18 @@ def _win_find_next_article_on_account_page(date_labels: list[str], visited_title
 
 
 def _win_open_article_by_index(index: int) -> bool:
+    if _win_visual_strategy_enabled():
+        points = _win_client_point_sequence(
+            "WECHAT_WINDOWS_ARTICLE_CLIENT_POINTS",
+            "300,180;300,430;300,555;300,680;300,805",
+        )
+        if index >= len(points):
+            return False
+        handle = _win_foreground_handle() or _win_wechat_window_info(activate=False).handle
+        x, y = points[index]
+        _win_click_client(handle, int(x), int(y))
+        return True
+
     points = _win_point_sequence("WECHAT_WINDOWS_ARTICLE_POINTS", "0.500,0.360;0.500,0.500;0.500,0.640")
     if index >= len(points):
         return False
@@ -2312,8 +3822,35 @@ def _win_open_article_by_index(index: int) -> bool:
     return True
 
 
-def _win_copy_visible_article_url() -> str:
+def _win_copy_visible_article_url(article_handle: int | None = None) -> str:
     _win_set_clipboard("")
+    if _win_visual_strategy_enabled():
+        try:
+            if article_handle:
+                _win_focus_known_window(article_handle)
+                bounds = _win_window_info_for_handle(article_handle)
+                base_left, base_top, base_width = bounds.left, bounds.top, bounds.width
+            else:
+                _win_wechat_window_info(activate=False)
+                base_left, base_top, base_width, _screen_height = _win_virtual_screen_bounds()
+            menu_x = base_left + base_width - _win_env_int("WECHAT_WINDOWS_ARTICLE_MENU_RIGHT_OFFSET", 117)
+            menu_y = base_top + _win_env_int("WECHAT_WINDOWS_ARTICLE_MENU_TOP_OFFSET", 20)
+            _win_click_point(menu_x, menu_y)
+            _sleep(0.8, 0.15)
+            copy_x = base_left + base_width - _win_env_int("WECHAT_WINDOWS_ARTICLE_COPY_RIGHT_OFFSET", 315)
+            copy_y = base_top + _win_env_int("WECHAT_WINDOWS_ARTICLE_COPY_TOP_OFFSET", 93)
+            _win_click_point(copy_x, copy_y)
+            _sleep(0.8, 0.15)
+            text = _win_clipboard().strip()
+            if "mp.weixin.qq.com" in text:
+                return text
+            return text
+        except WeChatForegroundError:
+            raise
+        except Exception as exc:
+            print(f"[wechat_foreground] Windows visual copy-link fallback failed: {exc}", flush=True)
+            return _win_clipboard().strip()
+
     for x, y in _win_point_sequence("WECHAT_WINDOWS_MORE_POINTS", "0.965,0.070;0.945,0.095;0.925,0.070"):
         more = _win_find_menu_or_button(("更多", "...", "···", "…"))
         if more:
@@ -2368,15 +3905,18 @@ try {
 using System;
 using System.Runtime.InteropServices;
 public class WeChatCaptureWin32 {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
   public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 }
 "@
+[WeChatCaptureWin32]::SetProcessDPIAware() | Out-Null
 } catch {}
 $script:targetHandle = [IntPtr]::Zero
 $script:targetArea = 0
@@ -2408,15 +3948,10 @@ try {
 } catch {}
 $targetHandle = $script:targetHandle
 if ($targetHandle -ne [IntPtr]::Zero) {
-  $rect = New-Object WeChatCaptureWin32+RECT
-  [WeChatCaptureWin32]::GetWindowRect($targetHandle, [ref]$rect) | Out-Null
-  $width = [Math]::Max(1, $rect.Right - $rect.Left)
-  $height = [Math]::Max(1, $rect.Bottom - $rect.Top)
-  $bitmap = New-Object System.Drawing.Bitmap $width, $height
+  $bounds = [System.Windows.Forms.Screen]::FromHandle($targetHandle).Bounds
+  $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
   $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-  $hdc = $graphics.GetHdc()
-  [WeChatCaptureWin32]::PrintWindow($targetHandle, $hdc, 2) | Out-Null
-  $graphics.ReleaseHdc($hdc)
+  $graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bounds.Size)
   $bitmap.Save($args[0], [System.Drawing.Imaging.ImageFormat]::Png)
   $graphics.Dispose()
   $bitmap.Dispose()
@@ -2438,16 +3973,25 @@ if ($targetHandle -ne [IntPtr]::Zero) {
 
 
 def _win_assert_renderable(account_name: str, stage: str) -> None:
+    if _win_visual_strategy_enabled():
+        foreground_process = _win_foreground_process_name()
+        if not _win_process_name_is_wechat(foreground_process):
+            raise WeChatForegroundError(
+                "Windows visual 模式检测到当前前台不是微信，已停止真实点击以避免误操作。"
+            )
     path = _win_debug_capture(account_name, stage)
     if not path:
+        if _win_visual_strategy_enabled():
+            raise WeChatForegroundError(
+                "Windows visual 模式无法截取可验证的微信画面，已停止真实点击以避免误操作。"
+            )
         return
     stats = _win_screenshot_stats(path)
-    if (
-        stats
-        and float(stats.get("avg_luma", 0.0)) >= 252.0
-        and float(stats.get("black_ratio", 1.0)) <= 0.01
-        and not _win_texts()
-    ):
+    if _win_screenshot_looks_black(stats):
+        raise WeChatForegroundError(
+            "Windows visual 模式截到黑屏/无效画面，已停止真实点击以避免误操作。"
+        )
+    if _win_screenshot_looks_white_without_content(stats, _win_texts()):
         raise WeChatForegroundError(
             "Windows 微信主窗口疑似白屏，已停止前台点击以避免继续打乱窗口。"
             "请手动恢复/重启微信主窗口后重试。"
@@ -2510,12 +4054,59 @@ def _win_find_top_left_search_placeholder() -> OCRText | None:
 
 def _win_find_account_result(account_name: str) -> OCRText | None:
     query = account_name.lower()
+    texts = _win_texts()
+
+    account_sections = [
+        item for item in texts
+        if item.text.strip() == "公众号"
+        and item.x < 0.35
+        and 0.12 < item.y < 0.92
+    ]
+    if account_sections:
+        anchor = sorted(account_sections, key=lambda item: -item.y)[0]
+        stop_sections = [
+            item for item in texts
+            if item.x < 0.35
+            and item.y < anchor.y
+            and item.text.strip() in {"聊天记录", "收藏", "更多", "聊天文件"}
+        ]
+        lower_bound = max((item.y for item in stop_sections), default=max(anchor.y - 0.22, 0.05))
+        section_candidates = [
+            item for item in texts
+            if query in item.text.lower()
+            and item.x < 0.55
+            and lower_bound < item.y < anchor.y
+            and "搜索" not in item.text
+            and "网络查找" not in item.text
+        ]
+        if section_candidates:
+            found = sorted(section_candidates, key=lambda item: -item.y)[0]
+            return OCRText(
+                found.text,
+                max(0.045, min(found.x, 0.075)),
+                found.y - 0.025,
+                0.08,
+                found.h + 0.05,
+            )
+
+        # OCR can miss the account-name text but still see the "公众号" section.
+        # Click the first row under it and stay above chat-record/collection rows.
+        return OCRText(account_name, 0.060, max(anchor.y - 0.145, lower_bound + 0.025), 0.10, 0.08)
+
+    if _win_visual_strategy_enabled():
+        # On the compact Windows search panel the followed public-account card
+        # has a stable position below the "公众号" header. Avoid global text
+        # matching here because chat records and favorites can contain the same
+        # account name.
+        return OCRText(account_name, 0.060, 0.715, 0.10, 0.08)
+
     candidates = [
-        item for item in _win_texts()
+        item for item in texts
         if query in item.text.lower()
         and item.x < 0.55
         and 0.12 < item.y < 0.82
         and "搜索" not in item.text
+        and "网络查找" not in item.text
     ]
     return sorted(candidates, key=lambda item: -item.y)[0] if candidates else None
 
@@ -2557,6 +4148,10 @@ def _win_point_sequence(name: str, default: str) -> list[tuple[float, float]]:
     return points
 
 
+def _win_client_point_sequence(name: str, default: str) -> list[tuple[int, int]]:
+    return [(int(x), int(y)) for x, y in _win_point_sequence(name, default)]
+
+
 def _find_text_containing(text: str) -> OCRText | None:
     matches = [item for item in _ocr() if text in item.text]
     return sorted(matches, key=lambda item: -item.y)[0] if matches else None
@@ -2587,6 +4182,11 @@ def _main() -> int:
         help="Print a no-click Windows WeChat foreground diagnostic JSON snapshot.",
     )
     parser.add_argument(
+        "--preflight-windows-visual",
+        action="store_true",
+        help="Print a no-click readiness check for Windows visual foreground collection.",
+    )
+    parser.add_argument(
         "--no-capture",
         action="store_true",
         help="Skip diagnostic screenshot capture.",
@@ -2599,8 +4199,19 @@ def _main() -> int:
     parser.add_argument(
         "--max-articles",
         type=int,
-        default=3,
+        default=10,
         help="Maximum articles for cache scanning utilities.",
+    )
+    parser.add_argument(
+        "--target-date",
+        default=None,
+        help="Target publish date for cache scanning utilities, in YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=1,
+        help="Inclusive lookback window ending at --target-date.",
     )
     args = parser.parse_args()
 
@@ -2609,10 +4220,17 @@ def _main() -> int:
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0
 
+    if args.preflight_windows_visual:
+        data = preflight_windows_wechat_visual(capture=not args.no_capture)
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0 if data.get("ready") else 2
+
     if args.scan_windows_cache:
         rows = _collect_wechat_article_urls_windows_cache(
             account_name=args.scan_windows_cache,
             max_articles=args.max_articles,
+            target_date=args.target_date,
+            days=args.days,
         )
         print(json.dumps([item.__dict__ for item in rows], ensure_ascii=False, indent=2))
         return 0

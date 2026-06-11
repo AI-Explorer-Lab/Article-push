@@ -13,3 +13,4 @@ libs/
 .playwright-cli/
 *.png
 sogou_home.yml
+tests/

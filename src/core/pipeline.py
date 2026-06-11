@@ -30,7 +30,10 @@ from src.common.utils import load_json, write_json
 from src.infrastructure.error_logger import StageResult, write_error_log
 from src.middleware.pipeline_logger import PipelineLogger, init_logger
 
-load_dotenv()
+try:
+    load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+except Exception:
+    pass
 
 # 兼容 tomllib（Python 3.11+）和 tomli（回退）
 try:

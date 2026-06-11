@@ -43,8 +43,8 @@ from urllib.request import Request, urlopen
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
-except ImportError:
+    load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+except Exception:
     pass
 
 # ---------------------------------------------------------------------------
@@ -189,7 +189,7 @@ def fetch_wechat_foreground(
     try:
         from src.infrastructure.wechat_foreground_collector import collect_wechat_article_urls
 
-        max_articles = int(os.getenv("WECHAT_FOREGROUND_MAX_ARTICLES", "3"))
+        max_articles = int(os.getenv("WECHAT_FOREGROUND_MAX_ARTICLES", "10"))
         search_names = list(dict.fromkeys([account_name, *WECHAT_SOURCE_ACCOUNTS.get(account_name, [])]))
         print("    启动微信前台短接管采集 URL...")
         sys.stdout.flush()
