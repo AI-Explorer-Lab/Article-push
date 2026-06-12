@@ -248,7 +248,7 @@ WECHAT_ACCOUNT_IDS: dict[str, str] = {
 }
 ```
 
-微信公众号来源现在使用本机微信前台短接管采集 URL：pipeline 会短暂接管微信，搜索公众号、进入推送窗口或完整主页，识别 `今天`/`昨天` 等日期分组，打开文章并通过 `... -> 复制链接` 获取 `mp.weixin.qq.com` URL。macOS 使用系统截图/OCR/AppleScript/Swift，Windows 按策略分为两层：默认不做危险前台点击，优先诊断和缓存 fallback；显式设置 `WECHAT_WINDOWS_FOREGROUND_STRATEGY=visual` 后，会先恢复已有微信主窗口并截图预检，再用真实鼠标按窗口相对位置搜索、打开公众号和复制链接。Windows visual 路径不会自动点击任务栏/托盘微信图标，不会默认启动新的微信实例，也不会最大化/移动/拉伸微信窗口，避免白屏和误关 Codex/VS Code。拿到 URL 后，正文抓取、清洗、评估和写作继续在后台执行。详细流程见 `docs/wechat_frontstage_url_capture.md`。
+微信公众号来源现在使用本机微信前台短接管采集 URL：pipeline 会短暂接管微信，搜索公众号、进入推送窗口或完整主页，识别 `今天`/`昨天` 等日期分组，打开文章并通过 `... -> 复制链接` 获取 `mp.weixin.qq.com` URL。macOS 使用系统截图/OCR/AppleScript/Swift，Windows 按策略分为两层：默认不做危险前台点击，优先诊断和缓存 fallback；显式设置 `WECHAT_WINDOWS_FOREGROUND_STRATEGY=visual` 后，会先恢复已有微信主窗口并截图预检，第一步检查是否最大化，不是最大化就点击微信真实可见的最大化按钮，确认不是白屏后才搜索、打开公众号和复制链接。Windows visual 路径不会默认启动新的微信实例，也不会用 Win32 API 移动/拉伸微信窗口，避免白屏和误关 Codex/VS Code。拿到 URL 后，正文抓取、清洗、评估和写作继续在后台执行。详细流程见 `docs/wechat_frontstage_url_capture.md`。
 
 相关环境变量：
 
@@ -269,6 +269,7 @@ WECHAT_ACCOUNT_IDS: dict[str, str] = {
 | `WECHAT_WINDOWS_AFTER_AUTO_REVEAL_WAIT` | 自动恢复已有微信窗口并最大化后的短等待秒数 | `0.7` |
 | `WECHAT_WINDOWS_AFTER_RESTORE_WAIT` | 自动恢复已有微信窗口后的短等待秒数 | `0.45` |
 | `WECHAT_WINDOWS_AFTER_INITIAL_MAXIMIZE_WAIT` | 开始搜索前点击真实最大化按钮后的短等待秒数 | `0.35` |
+| `WECHAT_WINDOWS_REQUIRE_MAXIMIZED` | Windows visual 策略下是否要求搜索前先最大化微信；默认开启，设为 `0` 才跳过 | `1` |
 | `WECHAT_WINDOWS_REQUIRE_VISUAL_PREFLIGHT` | `visual` 策略下正式点击前是否必须通过无点击预检；默认开启，避免白屏或误关其它窗口 | `1` |
 | `WECHAT_WINDOWS_ALLOW_FOREGROUND_CLICKS` | 兼容旧策略的手动开关；不推荐，优先用 `WECHAT_WINDOWS_FOREGROUND_STRATEGY=visual` | 未设置 |
 | `WECHAT_WINDOWS_ALLOW_VISUAL_MAXIMIZE` | 旧 Python/Win32 视觉最大化开关；实测不如 Computer Use 真实点击稳定 | 未设置 |
