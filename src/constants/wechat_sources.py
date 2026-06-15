@@ -40,7 +40,7 @@ WECHAT_SOURCE_ACCOUNTS: dict[str, list[str]] = {
     # 来源账号别名。默认可与 WECHAT_SOURCES 的名称相同。
     "ChallengeHub": ["ChallengeHub"],
     "量子位": ["量子位", "QbitAI"],
-    "Ai学习的老章": ["机器学习算法与Python实战"],
+    "Ai学习的老章": ["Ai学习的老章", "ai学习的老章", "老章"],
 }
 
 # ============================================================

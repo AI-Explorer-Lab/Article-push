@@ -1256,6 +1256,7 @@ def _collect_wechat_article_urls_windows(
     visual_strategy = _win_visual_strategy_enabled()
     if visual_strategy and os.getenv("WECHAT_WINDOWS_REQUIRE_VISUAL_PREFLIGHT", "1").strip() != "0":
         _win_require_visual_preflight(account_name)
+        _win_cleanup_to_main_wechat_visual()
 
     user_confirmed_foreground = False
     if prompt_user and _is_interactive():
@@ -1447,18 +1448,11 @@ def _win_restore_account_after_article(account_name: str, account_handle: int, a
 
 
 def _win_cleanup_after_account_visual(account_handle: int) -> None:
-    """Close the known account popup and return to the existing main WeChat window."""
+    """Close account/article child windows and return to the existing main WeChat window."""
     if os.getenv("WECHAT_FOREGROUND_KEEP_ACCOUNT_WINDOW", "").strip() == "1":
         return
     _win_set_window_title_hint("")
     _win_set_window_process_hint("Weixin")
-
-    try:
-        if account_handle and _win_should_close_visual_account_window(account_handle):
-            _win_close_known_window(account_handle)
-            _sleep(0.5, 0.1)
-    except WeChatForegroundError as exc:
-        print(f"[wechat_foreground] Windows visual cleanup skipped account window close: {exc}", flush=True)
 
     main_handle = 0
     try:
@@ -1466,11 +1460,57 @@ def _win_cleanup_after_account_visual(account_handle: int) -> None:
     except Exception:
         main_handle = 0
 
+    close_handles: list[int] = []
+    if account_handle:
+        close_handles.append(account_handle)
+    try:
+        close_handles.extend(_win_visible_wechat_top_level_handles())
+    except Exception as exc:
+        print(f"[wechat_foreground] Windows visual cleanup could not enumerate WeChat windows: {exc}", flush=True)
+
+    seen: set[int] = set()
+    for handle in close_handles:
+        if not handle or handle in seen or handle == main_handle:
+            continue
+        seen.add(handle)
+        try:
+            if _win_window_title_is_main_wechat(_win_window_title_for_handle(handle)):
+                continue
+            _win_close_known_window(handle)
+            _sleep(0.5, 0.1)
+        except WeChatForegroundError as exc:
+            print(f"[wechat_foreground] Windows visual cleanup skipped child window close: {exc}", flush=True)
+
+    if not main_handle:
+        try:
+            main_handle = _win_choose_existing_wechat_window_handle()
+        except Exception:
+            main_handle = 0
+
     if main_handle:
         try:
             _win_focus_known_window(main_handle)
         except WeChatForegroundError as exc:
             print(f"[wechat_foreground] Windows visual cleanup could not focus main WeChat: {exc}", flush=True)
+
+
+def _win_cleanup_to_main_wechat_visual() -> None:
+    """Best-effort cleanup used before moving from one account to the next."""
+    if not _win_visual_strategy_enabled():
+        return
+    try:
+        _win_cleanup_after_account_visual(0)
+    except WeChatForegroundError as exc:
+        print(f"[wechat_foreground] Windows visual cleanup to main skipped: {exc}", flush=True)
+
+
+def cleanup_windows_wechat_visual() -> None:
+    """Public best-effort cleanup hook for pipeline/account boundaries."""
+    if sys.platform != "win32":
+        return
+    if not _win_visual_strategy_enabled():
+        return
+    _win_cleanup_to_main_wechat_visual()
 
 
 def _win_should_close_visual_account_window(handle: int) -> bool:
@@ -2589,6 +2629,53 @@ def _win_main_wechat_window_info_ctypes() -> WindowsWindowInfo:
     return max(candidates, key=lambda item: item[0])[1]
 
 
+def _win_visible_wechat_top_level_handles() -> list[int]:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p)
+    user32.EnumWindows.argtypes = [EnumWindowsProc, ctypes.c_void_p]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = [ctypes.c_void_p]
+    user32.IsIconic.restype = wintypes.BOOL
+
+    handles: list[int] = []
+
+    @EnumWindowsProc
+    def callback(hwnd: int, _lparam: int) -> bool:
+        try:
+            handle = int(hwnd or 0)
+            if handle <= 0:
+                return True
+            if not _win_process_name_is_wechat(_win_window_process_name_for_handle(handle)):
+                return True
+            if not bool(user32.IsWindowVisible(ctypes.c_void_p(handle))):
+                return True
+            if bool(user32.IsIconic(ctypes.c_void_p(handle))):
+                return True
+            title = _win_window_title_for_handle(handle)
+            class_name = _win_window_class_for_handle(handle)
+            if title in {"WxTrayIconMessageWindow", "MSCTFIME UI", "Default IME"}:
+                return True
+            if "WxTrayIconMessageWindow" in class_name:
+                return True
+            if _win_window_is_auxiliary_blank(handle):
+                return True
+            info = _win_window_info_for_handle(handle)
+            if info.width < 180 or info.height < 120:
+                return True
+            handles.append(handle)
+        except Exception:
+            return True
+        return True
+
+    user32.EnumWindows(callback, None)
+    return handles
+
+
 def _win_wechat_rect(standardize: bool = False) -> tuple[int, int, int, int]:
     info = _win_wechat_window_info(activate=not _win_visual_strategy_enabled())
     if standardize:
@@ -2911,13 +2998,91 @@ def _win_focus_known_window(handle: int) -> None:
 
 def _win_close_known_window(handle: int) -> None:
     _win_assert_wechat_window_handle(handle, "close")
+    title = _win_window_title_for_handle(handle)
+    if _win_window_title_is_main_wechat(title):
+        raise WeChatForegroundError("Windows visual cleanup refused to close the main WeChat window.")
     info = _win_window_info_for_handle(handle)
-    _win_focus_known_window(handle)
+    try:
+        _win_focus_known_window(handle)
+    except WeChatForegroundError:
+        _win_post_close_known_window(handle)
+        _sleep(0.45, 0.08)
+        if _win_window_exists(handle):
+            _win_close_process_main_window_for_handle(handle)
+            _sleep(0.45, 0.08)
+        return
     # Click this specific window's title-bar close button instead of sending
     # Ctrl+W globally; this prevents closing Codex/VS Code when focus drifts.
     close_x = info.left + info.width - 18
     close_y = info.top + 18
     _win_click_point(close_x, close_y)
+    _sleep(0.35, 0.08)
+    if _win_window_exists(handle):
+        _win_post_close_known_window(handle)
+        _sleep(0.45, 0.08)
+    if _win_window_exists(handle):
+        _win_close_process_main_window_for_handle(handle)
+        _sleep(0.45, 0.08)
+
+
+def _win_process_id_for_handle(handle: int) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(ctypes.c_void_p(handle), ctypes.byref(pid))
+    return int(pid.value)
+
+
+def _win_close_process_main_window_for_handle(handle: int) -> None:
+    _win_assert_wechat_window_handle(handle, "process main-window close")
+    title = _win_window_title_for_handle(handle)
+    if _win_window_title_is_main_wechat(title):
+        raise WeChatForegroundError("Windows visual cleanup refused to process-close the main WeChat window.")
+    pid = _win_process_id_for_handle(handle)
+    if not pid:
+        raise WeChatForegroundError(f"Windows failed to resolve process for WeChat window: {handle}")
+    script = r"""
+param([int]$ProcessId)
+$process = [System.Diagnostics.Process]::GetProcessById($ProcessId)
+if ($process.ProcessName -notin @('Weixin', 'WeChat', 'WeChatAppEx')) {
+  throw "Refused to CloseMainWindow for non-WeChat process: $($process.ProcessName)"
+}
+$result = $process.CloseMainWindow()
+if (-not $result) {
+  throw "CloseMainWindow returned false for process: $ProcessId"
+}
+"""
+    _win_powershell(script, str(pid), timeout=6.0)
+
+
+def _win_window_exists(handle: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.IsWindow.argtypes = [ctypes.c_void_p]
+    user32.IsWindow.restype = wintypes.BOOL
+    return bool(user32.IsWindow(ctypes.c_void_p(handle)))
+
+
+def _win_post_close_known_window(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    _win_assert_wechat_window_handle(handle, "targeted close")
+    title = _win_window_title_for_handle(handle)
+    if _win_window_title_is_main_wechat(title):
+        raise WeChatForegroundError("Windows visual cleanup refused to post-close the main WeChat window.")
+    user32 = ctypes.windll.user32
+    user32.PostMessageW.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, ctypes.c_void_p]
+    user32.PostMessageW.restype = wintypes.BOOL
+    WM_CLOSE = 0x0010
+    if not user32.PostMessageW(ctypes.c_void_p(handle), WM_CLOSE, None, None):
+        raise WeChatForegroundError(f"Windows failed to post WM_CLOSE to WeChat window: {handle}")
 
 
 def _win_window_info_looks_minimized(info: WindowsWindowInfo) -> bool:
@@ -3677,6 +3842,65 @@ def _win_virtual_screen_bounds() -> tuple[int, int, int, int]:
     )
 
 
+def _win_monitor_bounds_for_handle(handle: int) -> tuple[int, int, int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", wintypes.LONG),
+            ("top", wintypes.LONG),
+            ("right", wintypes.LONG),
+            ("bottom", wintypes.LONG),
+        ]
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", RECT),
+            ("rcWork", RECT),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    user32 = ctypes.windll.user32
+    user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    user32.MonitorFromWindow.restype = ctypes.c_void_p
+    user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+    MONITOR_DEFAULTTONEAREST = 0x00000002
+    monitor = user32.MonitorFromWindow(ctypes.c_void_p(handle), MONITOR_DEFAULTTONEAREST)
+    if not monitor:
+        return _win_virtual_screen_bounds()
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return _win_virtual_screen_bounds()
+    rect = info.rcMonitor
+    return int(rect.left), int(rect.top), int(rect.right - rect.left), int(rect.bottom - rect.top)
+
+
+def _win_image_projection_for_window(
+    handle: int,
+    window_info: WindowsWindowInfo,
+    image_width: int,
+    image_height: int,
+) -> tuple[float, float, float, float]:
+    monitor_left, monitor_top, monitor_width, monitor_height = _win_monitor_bounds_for_handle(handle)
+    if monitor_width > 0 and monitor_height > 0:
+        scale_x = image_width / monitor_width
+        scale_y = image_height / monitor_height
+        base_x = (window_info.left - monitor_left) * scale_x
+        base_y = (window_info.top - monitor_top) * scale_y
+        if -image_width * 0.25 <= base_x <= image_width * 1.25 and -image_height * 0.25 <= base_y <= image_height * 1.25:
+            return base_x, base_y, scale_x, scale_y
+
+    virtual_left, virtual_top, virtual_width, virtual_height = _win_virtual_screen_bounds()
+    scale_x = image_width / virtual_width if virtual_width > 0 else 1.0
+    scale_y = image_height / virtual_height if virtual_height > 0 else 1.0
+    return (window_info.left - virtual_left) * scale_x, (window_info.top - virtual_top) * scale_y, scale_x, scale_y
+
+
 def _win_click_norm(norm_x: float, norm_y_from_bottom: float) -> None:
     left, top, width, height = _win_virtual_screen_bounds()
     _win_click_point(left + norm_x * width, top + (1.0 - norm_y_from_bottom) * height)
@@ -4004,14 +4228,27 @@ def _win_open_account_result(account_name: str) -> bool:
         if result:
             attempts.append(("norm", (result.cx, result.cy)))
         if not attempts and _win_recent_search_matches(account_name):
+            if os.getenv("WECHAT_WINDOWS_ALLOW_PUBLIC_ACCOUNT_COORD_CLICK", "").strip() != "1":
+                print(
+                    "[wechat_foreground] Windows visual public-account coordinate click is disabled; "
+                    "refusing to click search rows that could hit chat history.",
+                    flush=True,
+                )
+                return False
             info = _win_wechat_window_info(activate=False)
             detected_points = _win_public_account_result_client_points_from_screenshot(account_name, info.handle)
+            detected_points = [
+                (x, y) for x, y in detected_points
+                if _win_public_account_result_y_allowed(float(y))
+            ]
             if detected_points:
                 attempts.extend(("client", (float(x), float(y))) for x, y in detected_points)
-            attempts.extend(
-                ("client", (float(x), float(y)))
-                for x, y in _win_public_account_result_client_points()
-            )
+            else:
+                fallback_points = [
+                    (x, y) for x, y in _win_public_account_result_client_points()
+                    if _win_public_account_result_y_allowed(float(y))
+                ]
+                attempts.extend(("client", (float(x), float(y))) for x, y in fallback_points)
         elif os.getenv("WECHAT_WINDOWS_ALLOW_RESULT_COORD_FALLBACK", "").strip() == "1":
             attempts.extend(("client", (float(x), float(y))) for x, y in _win_search_result_client_points())
         elif not attempts:
@@ -4036,6 +4273,9 @@ def _win_open_account_result(account_name: str) -> bool:
             else:
                 info = _win_wechat_window_info(activate=False)
                 _win_click_client(info.handle, int(point[0]), int(point[1]))
+                if _win_public_account_result_y_allowed(point[1]):
+                    _sleep(0.12, 0.03)
+                    _win_click_client(info.handle, int(point[0]), int(point[1]))
             _sleep(0.85, 0.15)
             if _win_opened_expected_account_result(account_name):
                 return True
@@ -4075,15 +4315,21 @@ def _win_recent_search_matches(account_name: str) -> bool:
         return False
     return (time.time() - _WIN_LAST_SEARCH_AT) <= _win_env_float(
         "WECHAT_WINDOWS_SEARCH_RESULT_FRESH_SECONDS",
-        8.0,
+        45.0,
     )
 
 
 def _win_public_account_result_client_points() -> list[tuple[int, int]]:
     return _win_client_point_sequence(
         "WECHAT_WINDOWS_PUBLIC_ACCOUNT_RESULT_CLIENT_POINTS",
-        "170,225;195,225;145,225;170,335;195,335;145,335;170,405;195,405;145,405",
+        "170,125;195,125;145,125;170,135;195,135;145,135",
     )
+
+
+def _win_public_account_result_y_allowed(client_y: float) -> bool:
+    min_y = _win_env_int("WECHAT_WINDOWS_PUBLIC_ACCOUNT_RESULT_MIN_Y", 105)
+    max_y = _win_env_int("WECHAT_WINDOWS_PUBLIC_ACCOUNT_RESULT_MAX_Y", 190)
+    return min_y <= client_y <= max_y
 
 
 def _win_public_account_result_client_points_from_screenshot(
@@ -4093,9 +4339,8 @@ def _win_public_account_result_client_points_from_screenshot(
     """Detect the public-account row from the visible search overlay.
 
     UI Automation often cannot see WeChat's search overlay. The visual path
-    therefore locates the public-account row by looking for the green account
-    name text beside a large account icon, skipping search suggestions that only
-    have a small magnifier icon.
+    therefore locates likely account-result rows around highlighted account text
+    and lets the account-window validation reject chat history/contact misses.
     """
     try:
         path = _win_debug_capture(account_name, "public_account_result_probe")
@@ -4103,14 +4348,15 @@ def _win_public_account_result_client_points_from_screenshot(
             return []
         from PIL import Image
 
-        info = _win_window_info_for_handle(handle)
-        virtual_left, virtual_top, virtual_width, virtual_height = _win_virtual_screen_bounds()
         image = Image.open(path).convert("RGB")
         try:
-            scale_x = image.width / virtual_width if virtual_width > 0 else 1.0
-            scale_y = image.height / virtual_height if virtual_height > 0 else 1.0
-            base_x = (info.left - virtual_left) * scale_x
-            base_y = (info.top - virtual_top) * scale_y
+            info = _win_window_info_for_handle(handle)
+            base_x, base_y, scale_x, scale_y = _win_image_projection_for_window(
+                handle,
+                info,
+                image.width,
+                image.height,
+            )
 
             def to_px_x(client_x: float) -> int:
                 return int(base_x + (client_x * scale_x))
@@ -4147,9 +4393,11 @@ def _win_public_account_result_client_points_from_screenshot(
             if active:
                 clusters.append((sum(active) / len(active), sum(green_rows[y] for y in active)))
 
-            candidates: list[tuple[int, int]] = []
+            candidates: list[tuple[int, int, int]] = []
             for green_y, weight in clusters:
                 if weight < 8:
+                    continue
+                if not _win_public_account_result_y_allowed(green_y):
                     continue
                 icon_x1 = max(0, to_px_x(82))
                 icon_x2 = min(image.width, to_px_x(145))
@@ -4157,7 +4405,7 @@ def _win_public_account_result_client_points_from_screenshot(
                 icon_y2 = min(image.height, to_px_y(green_y + 34))
                 if icon_x2 <= icon_x1 or icon_y2 <= icon_y1:
                     continue
-                dark_pixels = 0
+                icon_pixels = 0
                 weighted_y = 0.0
                 for iy in range(icon_y1, icon_y2, 2):
                     client_iy = (iy - base_y) / scale_y
@@ -4165,21 +4413,41 @@ def _win_public_account_result_client_points_from_screenshot(
                         r, g, b = image.getpixel((ix, iy))
                         luma = (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
                         saturated = max(r, g, b) - min(r, g, b)
-                        if luma < 225 and saturated > 18:
-                            dark_pixels += 1
+                        if luma < 225 and (saturated > 18 or luma < 150):
+                            icon_pixels += 1
                             weighted_y += client_iy
-                if dark_pixels < 35:
+                if icon_pixels < 30:
                     continue
-                icon_center_y = weighted_y / dark_pixels
-                if abs(icon_center_y - green_y) > 18:
+                icon_center_y = weighted_y / icon_pixels
+                if abs(icon_center_y - green_y) > 34:
                     continue
-                row_y = int(round(icon_center_y))
-                candidates.append((row_y, weight))
+                row_y = int(round(green_y + 8))
+                if 105 <= row_y <= 190:
+                    priority = 0
+                else:
+                    priority = 1
+                candidates.append((priority, row_y, weight))
 
             if not candidates:
                 return []
-            row_y = sorted(candidates, key=lambda item: (item[0], -item[1]))[0][0]
-            return [(170, row_y), (195, row_y), (145, row_y), (170, row_y + 10), (170, row_y - 10)]
+            row_ys: list[int] = []
+            for _, row_y, _ in sorted(candidates, key=lambda item: (item[0], item[1], -item[2])):
+                if all(abs(row_y - existing) > 24 for existing in row_ys):
+                    row_ys.append(row_y)
+                if len(row_ys) >= 5:
+                    break
+            points: list[tuple[int, int]] = []
+            for row_y in row_ys:
+                points.extend(
+                    [
+                        (170, row_y),
+                        (195, row_y),
+                        (145, row_y),
+                        (170, row_y + 10),
+                        (170, row_y - 10),
+                    ]
+                )
+            return points
         finally:
             image.close()
     except Exception:
@@ -4221,14 +4489,15 @@ def _win_visual_search_panel_looks_ready_from_screenshot(account_name: str, hand
             return False
         from PIL import Image
 
-        info = _win_window_info_for_handle(handle)
-        virtual_left, virtual_top, virtual_width, virtual_height = _win_virtual_screen_bounds()
         image = Image.open(path).convert("RGB")
         try:
-            scale_x = image.width / virtual_width if virtual_width > 0 else 1.0
-            scale_y = image.height / virtual_height if virtual_height > 0 else 1.0
-            base_x = (info.left - virtual_left) * scale_x
-            base_y = (info.top - virtual_top) * scale_y
+            info = _win_window_info_for_handle(handle)
+            base_x, base_y, scale_x, scale_y = _win_image_projection_for_window(
+                handle,
+                info,
+                image.width,
+                image.height,
+            )
             x1 = max(0, int(base_x + (78 * scale_x)))
             y1 = max(0, int(base_y + (48 * scale_y)))
             x2 = min(image.width, int(base_x + (334 * scale_x)))
@@ -4280,7 +4549,12 @@ def _win_opened_expected_account_result(account_name: str) -> bool:
     bad_markers = ("搜一搜", "搜索网络结果", "搜索聊天记录", "聊天记录", "Search chat history")
     if any(marker.lower() in haystack for marker in bad_markers):
         return False
-    return query in haystack
+    if title.strip() in {"\u516c\u4f17\u53f7", "Public Account", "Public Accounts"}:
+        return True
+    title_clean = title.strip().lower()
+    if "@" in title_clean:
+        return False
+    return title_clean == query
 
 
 def _win_recover_after_wrong_account_result() -> None:
@@ -4301,6 +4575,102 @@ def _win_recover_after_wrong_account_result() -> None:
             _win_focus_known_window(main_handle)
         except WeChatForegroundError:
             pass
+
+
+def diagnose_windows_account_open_flow(account_name: str, until_step: int = 3) -> dict[str, object]:
+    """Run the Windows visual account-opening flow step by step for debugging."""
+    data: dict[str, object] = {
+        "account": account_name,
+        "until_step": until_step,
+        "steps": [],
+    }
+
+    def add_step(name: str, **values: object) -> None:
+        steps = data.setdefault("steps", [])
+        assert isinstance(steps, list)
+        steps.append({"name": name, **values})
+
+    try:
+        _win_reset_visual_session()
+        _win_set_window_title_hint("")
+        _win_set_window_process_hint("Weixin")
+        _win_require_visual_preflight(account_name)
+        info = _win_wechat_window_info(activate=False)
+        add_step(
+            "1_preflight_wechat_window",
+            ok=True,
+            handle=info.handle,
+            left=info.left,
+            top=info.top,
+            width=info.width,
+            height=info.height,
+        )
+    except Exception as exc:
+        add_step("1_preflight_wechat_window", ok=False, error=f"{type(exc).__name__}: {exc}")
+        return data
+
+    if until_step <= 1:
+        return data
+
+    try:
+        _win_search_account(account_name)
+        _sleep(_win_env_float("WECHAT_WINDOWS_AFTER_SEARCH_WAIT", 0.65), 0.12)
+        after_search = _win_debug_capture(account_name, "diagnose_step2_after_search")
+        handle = _win_foreground_handle()
+        panel_ready = _win_visual_search_panel_ready(account_name)
+        texts = [item.text for item in sorted(_win_texts_for_handle(handle), key=lambda item: (-item.y, item.x))[:24]] if handle else []
+        add_step(
+            "2_search_account",
+            ok=panel_ready,
+            foreground_handle=handle,
+            screenshot=str(after_search) if after_search else "",
+            uia_text_preview=texts,
+        )
+    except Exception as exc:
+        add_step("2_search_account", ok=False, error=f"{type(exc).__name__}: {exc}")
+        return data
+
+    if until_step <= 2:
+        return data
+
+    try:
+        info = _win_wechat_window_info(activate=False)
+        result = _win_find_account_result(account_name)
+        screenshot_points = _win_public_account_result_client_points_from_screenshot(account_name, info.handle)
+        add_step(
+            "3_before_open_account_result",
+            ok=bool(result or screenshot_points),
+            uia_candidate=(
+                {
+                    "text": result.text,
+                    "cx": result.cx,
+                    "cy": result.cy,
+                    "x": result.x,
+                    "y": result.y,
+                    "w": result.w,
+                    "h": result.h,
+                }
+                if result
+                else None
+            ),
+            screenshot_points=screenshot_points,
+        )
+        opened = _win_open_account_result(account_name)
+        _sleep(0.35, 0.08)
+        handle = _win_foreground_handle()
+        title = _win_window_title_for_handle(handle) if handle else ""
+        after_open = _win_debug_capture(account_name, "diagnose_step3_after_open_account")
+        add_step(
+            "3_open_account_result",
+            ok=opened,
+            foreground_handle=handle,
+            foreground_title=title,
+            screenshot=str(after_open) if after_open else "",
+        )
+    except Exception as exc:
+        add_step("3_open_account_result", ok=False, error=f"{type(exc).__name__}: {exc}")
+
+    return data
 
 
 def _win_looks_like_chat_history_search_popup() -> bool:
@@ -4942,9 +5312,7 @@ def _win_find_account_result(account_name: str) -> OCRText | None:
 
         # OCR can miss the account-name text but still see the "公众号" section.
         # Click the first row under it and stay above chat-record/collection rows.
-        if not _win_visual_strategy_enabled():
-            return OCRText(account_name, 0.060, max(anchor.y - 0.145, lower_bound + 0.025), 0.10, 0.08)
-        return None
+        return OCRText(account_name, 0.060, max(anchor.y - 0.145, lower_bound + 0.025), 0.10, 0.08)
 
     if _win_visual_strategy_enabled():
         # On the compact Windows search panel the followed public-account card
@@ -5050,6 +5418,23 @@ def _main() -> int:
         help="Print recent cached mp.weixin article URLs for a Windows WeChat account name.",
     )
     parser.add_argument(
+        "--diagnose-windows-account-flow",
+        metavar="ACCOUNT",
+        help="Run Windows visual WeChat account-open flow step by step and print JSON diagnostics.",
+    )
+    parser.add_argument(
+        "--cleanup-windows-visual",
+        action="store_true",
+        help="Close visible Windows WeChat child windows and refocus the main WeChat window.",
+    )
+    parser.add_argument(
+        "--until-step",
+        type=int,
+        default=3,
+        choices=(1, 2, 3),
+        help="Last step for --diagnose-windows-account-flow: 1=preflight, 2=search, 3=open account result.",
+    )
+    parser.add_argument(
         "--max-articles",
         type=int,
         default=10,
@@ -5077,6 +5462,22 @@ def _main() -> int:
         data = preflight_windows_wechat_visual(capture=not args.no_capture)
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0 if data.get("ready") else 2
+
+    if args.diagnose_windows_account_flow:
+        data = diagnose_windows_account_open_flow(
+            args.diagnose_windows_account_flow,
+            until_step=args.until_step,
+        )
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        steps = data.get("steps", [])
+        failed = any(isinstance(step, dict) and not step.get("ok") for step in steps if isinstance(step, dict))
+        return 2 if failed else 0
+
+    if args.cleanup_windows_visual:
+        cleanup_windows_wechat_visual()
+        data = diagnose_windows_wechat_foreground(capture=False)
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
 
     if args.scan_windows_cache:
         rows = _collect_wechat_article_urls_windows_cache(

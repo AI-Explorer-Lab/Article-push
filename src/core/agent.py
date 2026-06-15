@@ -187,7 +187,10 @@ def fetch_wechat_foreground(
     # 日期窗口由微信主页分组识别承担。
 
     try:
-        from src.infrastructure.wechat_foreground_collector import collect_wechat_article_urls
+        from src.infrastructure.wechat_foreground_collector import (
+            collect_wechat_article_urls,
+            cleanup_windows_wechat_visual,
+        )
 
         max_articles = int(os.getenv("WECHAT_FOREGROUND_MAX_ARTICLES", "10"))
         search_names = list(dict.fromkeys([account_name, *WECHAT_SOURCE_ACCOUNTS.get(account_name, [])]))
@@ -207,6 +210,8 @@ def fetch_wechat_foreground(
             except Exception as exc:
                 errors.append(f"{search_name}: {exc}")
                 articles = []
+            finally:
+                cleanup_windows_wechat_visual()
             if articles:
                 break
         if not articles and errors:
